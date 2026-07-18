@@ -25,6 +25,11 @@ use std::io::ErrorKind;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Source of `TransactionalMemory::cache_instance_id`. Starts at 1 so that 0 can mean
+// "no database" in thread-local page cache entries.
+static NEXT_CACHE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 use std::thread;
 
 // The region header is optional in the v3 file format
@@ -101,6 +106,10 @@ impl PageResolver {
 
     pub(crate) fn get_page(&self, page_number: PageNumber, hint: PageHint) -> Result<PageImpl> {
         self.mem.get_page(page_number, hint)
+    }
+
+    pub(crate) fn cache_instance_id(&self) -> u64 {
+        self.mem.cache_instance_id
     }
 
     pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
@@ -305,6 +314,9 @@ impl InMemoryState {
 }
 
 pub(crate) struct TransactionalMemory {
+    // Process-unique id of this instance, distinguishing entries in the thread-local
+    // page cache across databases and across reopens of the same database
+    cache_instance_id: u64,
     // TODO: Maybe we should move all this unpersisted stuff to another transaction layer.
     // There are durable commits which support persistent and ephemeral savepoints.
     // And then non-durable commits which support only ephemeral savepoints, and basically
@@ -460,6 +472,7 @@ impl TransactionalMemory {
         assert!(page_size >= DB_HEADER_SIZE);
 
         Ok(Self {
+            cache_instance_id: NEXT_CACHE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             unpersisted: Mutex::new(PageNumberHashSet::default()),
             unpersisted_allocations: Mutex::new(BTreeMap::new()),
             unpersisted_allocation_txn: Mutex::new(PageNumberHashMap::default()),

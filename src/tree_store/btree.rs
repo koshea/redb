@@ -7,7 +7,9 @@ use crate::tree_store::btree_base::{
 use crate::tree_store::btree_cursor::{CursorMut, Position};
 use crate::tree_store::btree_iters::range_is_empty;
 use crate::tree_store::btree_mutator::MutateHelper;
-use crate::tree_store::page_store::{Page, PageImpl, PageMut};
+use crate::tree_store::page_store::{
+    CacheTag, Page, PageImpl, PageMut, ThreadLocalPageCache, with_thread_local_page_cache,
+};
 use crate::tree_store::{
     AccessGuardMutInPlace, AllPageNumbersBtreeIter, BtreeCursorRange, BtreeExtractIf,
     PageAllocator, PageHint, PageNumber, PageResolver, PageTrackerPolicy,
@@ -21,6 +23,7 @@ use std::cmp::max;
 use std::collections::{Bound, HashMap};
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 pub(crate) struct BtreeStats {
@@ -950,11 +953,40 @@ impl RawBtree {
     }
 }
 
+// A page visited during a lookup: the tree's root borrowed from `Btree::cached_root`,
+// a page from the shared page cache, or this thread's private copy of a branch page.
+enum NodePage<'a> {
+    Root(&'a PageImpl),
+    Shared(PageImpl),
+    Local(PageNumber, Rc<[u8]>),
+}
+
+impl Page for NodePage<'_> {
+    fn memory(&self) -> &[u8] {
+        match self {
+            Self::Root(page) => page.memory(),
+            Self::Shared(page) => page.memory(),
+            Self::Local(_, bytes) => bytes,
+        }
+    }
+
+    fn get_page_number(&self) -> PageNumber {
+        match self {
+            Self::Root(page) => page.get_page_number(),
+            Self::Shared(page) => page.get_page_number(),
+            Self::Local(page_number, _) => *page_number,
+        }
+    }
+}
+
 pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
     mem: PageResolver,
     transaction_guard: Arc<TransactionGuard>,
     // Cache of the root page to avoid repeated lookups
     cached_root: Option<PageImpl>,
+    // Tag validating this reader's snapshot in the thread-local page cache. Only
+    // present on read transactions: see `ThreadLocalPageCache`.
+    cache_tag: Option<CacheTag>,
     root: Option<BtreeHeader>,
     hint: PageHint,
     _key_type: PhantomData<K>,
@@ -973,10 +1005,19 @@ impl<K: Key, V: Value> Btree<K, V> {
         } else {
             None
         };
+        let cache_tag = if guard.is_read() {
+            Some(CacheTag {
+                instance: mem.cache_instance_id(),
+                generation: guard.id().raw_id(),
+            })
+        } else {
+            None
+        };
         Ok(Self {
             mem,
             transaction_guard: guard,
             cached_root,
+            cache_tag,
             root,
             hint,
             _key_type: PhantomData,
@@ -1022,35 +1063,94 @@ impl<K: Key, V: Value> Btree<K, V> {
     }
 
     pub(crate) fn get(&self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'static, V>>> {
-        if let Some(ref root_page) = self.cached_root {
-            self.get_helper(root_page, K::as_bytes(key).as_ref())
+        let Some(ref root_page) = self.cached_root else {
+            return Ok(None);
+        };
+        let key_bytes = K::as_bytes(key);
+        let query = key_bytes.as_ref();
+        if let Some(tag) = self.cache_tag {
+            with_thread_local_page_cache(|cache| {
+                self.get_helper(&mut cache.map(|cache| (cache, tag)), root_page, query)
+            })
         } else {
-            Ok(None)
+            self.get_helper(&mut None, root_page, query)
         }
     }
 
-    // Returns the value for the queried key, if present
-    fn get_helper(&self, page: &PageImpl, query: &[u8]) -> Result<Option<AccessGuard<'static, V>>> {
-        let node_mem = page.memory();
-        match node_mem[0] {
-            LEAF => {
-                let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
-                if let Some(entry_index) = accessor.find_key::<K>(query) {
+    // Returns the value for the queried key, if present, descending from the root and
+    // serving the top levels from the thread-local page cache when one is given
+    fn get_helper(
+        &self,
+        cache: &mut Option<(&mut ThreadLocalPageCache, CacheTag)>,
+        root: &PageImpl,
+        query: &[u8],
+    ) -> Result<Option<AccessGuard<'static, V>>> {
+        let mut node = NodePage::Root(root);
+        // The depth of the current node's children, counting the root's children as 1
+        let mut child_depth = 1;
+        loop {
+            let child_number = match node.memory()[0] {
+                LEAF => {
+                    let accessor =
+                        LeafAccessor::new(node.memory(), K::fixed_width(), V::fixed_width());
+                    let Some(entry_index) = accessor.find_key::<K>(query) else {
+                        return Ok(None);
+                    };
                     let (start, end) = accessor.value_range(entry_index).unwrap();
-                    let guard = AccessGuard::with_page(page.clone(), start..end);
-                    Ok(Some(guard))
-                } else {
-                    Ok(None)
+                    let page = match node {
+                        NodePage::Root(page) => page.clone(),
+                        NodePage::Shared(page) => page,
+                        // Only branch pages are cached in the thread-local cache
+                        NodePage::Local(..) => unreachable!(),
+                    };
+                    return Ok(Some(AccessGuard::with_page(page, start..end)));
                 }
-            }
-            BRANCH => {
-                let accessor = BranchAccessor::new(page, K::fixed_width());
-                let (_, child_page) = accessor.child_for_key::<K>(query);
-                let child_page = self.mem.get_page(child_page, self.hint)?;
-                self.get_helper(&child_page, query)
-            }
-            _ => unreachable!(),
+                BRANCH => {
+                    let accessor = BranchAccessor::new(&node, K::fixed_width());
+                    accessor.child_for_key::<K>(query).1
+                }
+                _ => unreachable!(),
+            };
+            node = self.get_page_for_read(cache, child_number, child_depth)?;
+            child_depth += 1;
         }
+    }
+
+    // The tree depth down to which lookups go through the thread-local page cache.
+    // Every lookup traverses one page per level, so the few pages of the top levels
+    // serve almost all of the traffic; deeper levels are too numerous to cache and
+    // each too cold to need it. When a level does not fit in the cache, the pages
+    // that lose their slots are simply read from the shared page cache as before.
+    const MAX_CACHED_DEPTH: u32 = 2;
+
+    // Fetches a page of the tree during a lookup. On read transactions, the top levels
+    // of branch pages are served from the thread's page cache: after the root, which is
+    // already served from `cached_root`, they are the hottest pages of the tree.
+    // Cache hits touch only thread-local memory, unlike reads through the shared page
+    // cache, whose lock stripe, LRU flag, and `Arc` refcount updates all cause
+    // cache-line contention when many threads read the same hot page.
+    fn get_page_for_read<'a>(
+        &'a self,
+        cache: &mut Option<(&mut ThreadLocalPageCache, CacheTag)>,
+        page_number: PageNumber,
+        depth: u32,
+    ) -> Result<NodePage<'a>> {
+        if depth <= Self::MAX_CACHED_DEPTH
+            && page_number.page_order == 0
+            && let Some((cache, tag)) = cache
+        {
+            if let Some(bytes) = cache.get(*tag, page_number) {
+                return Ok(NodePage::Local(page_number, bytes));
+            }
+            let page = self.mem.get_page(page_number, self.hint)?;
+            // Only cache branch pages: leaf pages must be served as `PageImpl`s from
+            // the shared cache anyway, because `AccessGuard`s hold them
+            if page.memory()[0] == BRANCH {
+                cache.insert(*tag, page_number, page.memory());
+            }
+            return Ok(NodePage::Shared(page));
+        }
+        Ok(NodePage::Shared(self.mem.get_page(page_number, self.hint)?))
     }
 
     pub(crate) fn first(

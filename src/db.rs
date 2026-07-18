@@ -330,6 +330,13 @@ impl TransactionGuard {
             }
         }
     }
+
+    // True for guards of read transactions, which read from an immutable snapshot.
+    // Write transactions may free and reallocate pages within the transaction, so
+    // readers they create must not cache pages.
+    pub(crate) fn is_read(&self) -> bool {
+        matches!(self, Self::Read { .. })
+    }
 }
 
 impl Drop for TransactionGuard {

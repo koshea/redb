@@ -112,4 +112,105 @@ mod multithreading_test {
         let table = read_txn.open_table(DEF3).unwrap();
         assert_eq!(table.len().unwrap(), 1);
     }
+
+    #[test]
+    // Concurrent lookups on a single shared table, racing to fill the read
+    // transaction's page cache, and on tables from separate transactions
+    fn multithreaded_reads() {
+        const TABLE: TableDefinition<u32, u64> = TableDefinition::new("multithreaded_reads");
+        const ELEMENTS: u32 = 10_000;
+        const THREADS: usize = 4;
+
+        let tmpfile = create_tempfile();
+        let db = Database::create(tmpfile.path()).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(TABLE).unwrap();
+            for i in 0..ELEMENTS {
+                table.insert(i, u64::from(i) * 7).unwrap();
+            }
+        }
+        write_txn.commit().unwrap();
+
+        let read_txn = db.begin_read().unwrap();
+        let table = Arc::new(read_txn.open_table(TABLE).unwrap());
+        thread::scope(|s| {
+            for _ in 0..THREADS {
+                let table = table.clone();
+                s.spawn(move || {
+                    for i in 0..ELEMENTS {
+                        assert_eq!(table.get(i).unwrap().unwrap().value(), u64::from(i) * 7);
+                    }
+                });
+            }
+        });
+
+        thread::scope(|s| {
+            for _ in 0..THREADS {
+                let db = &db;
+                s.spawn(move || {
+                    let read_txn = db.begin_read().unwrap();
+                    let table = read_txn.open_table(TABLE).unwrap();
+                    for i in 0..ELEMENTS {
+                        assert_eq!(table.get(i).unwrap().unwrap().value(), u64::from(i) * 7);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    // Readers fill their transactions' page caches while a writer concurrently rewrites
+    // the whole tree. Each read snapshot must stay internally consistent: every lookup
+    // in one transaction must observe the same round of writes.
+    fn concurrent_reads_and_writes() {
+        const TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("reads_and_writes");
+        const ELEMENTS: u32 = 20_000;
+        const ROUNDS: u8 = 4;
+        const READERS: usize = 3;
+
+        let tmpfile = create_tempfile();
+        let db = Database::create(tmpfile.path()).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(TABLE).unwrap();
+            for i in 0..ELEMENTS {
+                table.insert(i, [0u8; 50].as_slice()).unwrap();
+            }
+        }
+        write_txn.commit().unwrap();
+
+        thread::scope(|s| {
+            s.spawn(|| {
+                for round in 1..=ROUNDS {
+                    let write_txn = db.begin_write().unwrap();
+                    {
+                        let mut table = write_txn.open_table(TABLE).unwrap();
+                        for i in 0..ELEMENTS {
+                            table.insert(i, [round; 50].as_slice()).unwrap();
+                        }
+                    }
+                    write_txn.commit().unwrap();
+                }
+            });
+            for _ in 0..READERS {
+                s.spawn(|| {
+                    for _ in 0..2 {
+                        let read_txn = db.begin_read().unwrap();
+                        let table = read_txn.open_table(TABLE).unwrap();
+                        let round = table.get(0).unwrap().unwrap().value()[0];
+                        for i in 0..ELEMENTS {
+                            assert_eq!(table.get(i).unwrap().unwrap().value(), [round; 50]);
+                        }
+                    }
+                });
+            }
+        });
+
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(TABLE).unwrap();
+        for i in 0..ELEMENTS {
+            assert_eq!(table.get(i).unwrap().unwrap().value(), [ROUNDS; 50]);
+        }
+    }
 }

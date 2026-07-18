@@ -3406,3 +3406,144 @@ fn u8_array_serialization() {
         assert_eq!(ref_order, generic_order);
     }
 }
+
+#[test]
+// The read transaction's page cache holds pages of the snapshot for the duration of the
+// transaction. Verify that a long-lived reader keeps seeing its own snapshot while later
+// write transactions rewrite the whole tree, and that the pages pinned by the cache are
+// released when the transaction ends.
+fn read_snapshot_stable_while_writes_proceed() {
+    const TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("snapshot");
+    // Enough entries for a tree with several branch pages, so lookups populate the
+    // read transaction's page cache
+    const ELEMENTS: u32 = 20_000;
+
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(TABLE).unwrap();
+        for i in 0..ELEMENTS {
+            table.insert(i, [0u8; 50].as_slice()).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(TABLE).unwrap();
+    for i in 0..ELEMENTS {
+        assert_eq!(table.get(i).unwrap().unwrap().value(), [0u8; 50]);
+    }
+
+    // Rewrite every entry several times to copy-on-write the entire tree and free all
+    // pages of the reader's snapshot
+    for round in 1..=3u8 {
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(TABLE).unwrap();
+            for i in 0..ELEMENTS {
+                table.insert(i, [round; 50].as_slice()).unwrap();
+            }
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // The reader still sees its snapshot, including through its cached pages
+    for i in 0..ELEMENTS {
+        assert_eq!(table.get(i).unwrap().unwrap().value(), [0u8; 50]);
+    }
+
+    drop(table);
+    read_txn.close().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(TABLE).unwrap();
+    for i in 0..ELEMENTS {
+        assert_eq!(table.get(i).unwrap().unwrap().value(), [3u8; 50]);
+    }
+}
+
+#[test]
+// A read transaction that reads several tables one after another. Each table's reader
+// has its own page cache, so later tables are cached as well as the first.
+fn sequential_multi_table_reads() {
+    const TABLE_A: TableDefinition<u32, u64> = TableDefinition::new("multi_a");
+    const TABLE_B: TableDefinition<u32, u64> = TableDefinition::new("multi_b");
+    const ELEMENTS: u32 = 10_000;
+
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table_a = write_txn.open_table(TABLE_A).unwrap();
+        let mut table_b = write_txn.open_table(TABLE_B).unwrap();
+        for i in 0..ELEMENTS {
+            table_a.insert(i, u64::from(i)).unwrap();
+            table_b.insert(i, u64::from(i) * 2).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    {
+        let table_a = read_txn.open_table(TABLE_A).unwrap();
+        for i in 0..ELEMENTS {
+            assert_eq!(table_a.get(i).unwrap().unwrap().value(), u64::from(i));
+        }
+    }
+    {
+        let table_b = read_txn.open_table(TABLE_B).unwrap();
+        for i in 0..ELEMENTS {
+            assert_eq!(table_b.get(i).unwrap().unwrap().value(), u64::from(i) * 2);
+        }
+    }
+    // Re-reading the first table gets a fresh reader and cache
+    let table_a = read_txn.open_table(TABLE_A).unwrap();
+    for i in 0..ELEMENTS {
+        assert_eq!(table_a.get(i).unwrap().unwrap().value(), u64::from(i));
+    }
+}
+
+#[test]
+// The thread-local page cache is validated by snapshot generation: a sequence of short
+// read transactions on one thread, interleaved with writes, must never see bytes from
+// an earlier generation's cached pages.
+fn alternating_reads_and_writes_invalidate_thread_cache() {
+    const TABLE: TableDefinition<u32, u64> = TableDefinition::new("alternating");
+    const ELEMENTS: u32 = 10_000;
+
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(TABLE).unwrap();
+        for i in 0..ELEMENTS {
+            table.insert(i, 0).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    for round in 1..=5u64 {
+        {
+            let read_txn = db.begin_read().unwrap();
+            let table = read_txn.open_table(TABLE).unwrap();
+            for i in 0..ELEMENTS {
+                assert_eq!(table.get(i).unwrap().unwrap().value(), round - 1);
+            }
+        }
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(TABLE).unwrap();
+            for i in 0..ELEMENTS {
+                table.insert(i, round).unwrap();
+            }
+        }
+        write_txn.commit().unwrap();
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(TABLE).unwrap();
+        for i in 0..ELEMENTS {
+            assert_eq!(table.get(i).unwrap().unwrap().value(), round);
+        }
+    }
+}
