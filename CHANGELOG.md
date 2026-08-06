@@ -21,6 +21,9 @@
   be added behind the `experimental_cursor` feature flag, like the table cursors' were.
 
 ## 4.2.0 - 2026-XX-XX
+* Improve performance of `Durability::None` commits. They no longer write dirty pages to the file:
+  the pages are retained in the in-memory cache, where readers see them, and are written back by
+  the next durable commit or when evicted by cache pressure.
 * Add a `std` feature, enabled by default, in preparation for a future `no_std` mode. It gates
   nothing yet, so building with `default-features = false` still links against the standard
   library. Under the `experimental-api-5` feature flag, which collects the changes planned for
