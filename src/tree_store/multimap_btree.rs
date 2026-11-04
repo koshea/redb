@@ -1,5 +1,7 @@
 use crate::Result;
 use crate::sync::Mutex;
+use crate::tree_store::NativeOwnedPageVec;
+use crate::tree_store::NativeOwnedShared;
 use crate::tree_store::btree::{PagePath, UntypedBtree, UntypedBtreeMut, btree_stats};
 use crate::tree_store::btree_base::{
     BRANCH, BranchAccessor, BranchMutator, Checksum, DEFERRED, LEAF, LeafAccessor, LeafPageMut,
@@ -10,7 +12,6 @@ use crate::tree_store::{
     PageNumberHashMap, PageResolver, PageTracker, RawBtree,
 };
 use crate::types::{Key, TypeName, Value};
-use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::max;
@@ -202,7 +203,7 @@ pub(super) fn relocate_subtrees(
     key_size: Option<usize>,
     value_size: Option<usize>,
     page_allocator: PageAllocator,
-    freed_pages: Arc<Mutex<Vec<PageNumber>>>,
+    freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
     relocation_map: &PageNumberHashMap<PageNumber>,
 ) -> Result<(PageNumber, Checksum)> {
     let old_page = page_allocator.get_page(root.0, PageHint::None)?;
@@ -287,7 +288,7 @@ pub(super) fn finalize_tree_and_subtree_checksums(
     value_size: Option<usize>,
     page_allocator: PageAllocator,
 ) -> Result<Option<BtreeHeader>> {
-    let freed_pages = Arc::new(Mutex::new(vec![]));
+    let freed_pages = NativeOwnedShared::ordinary(Mutex::new(NativeOwnedPageVec::default()));
     let mut tree = UntypedBtreeMut::new(
         root,
         page_allocator.clone(),

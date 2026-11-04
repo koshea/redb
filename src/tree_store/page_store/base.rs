@@ -1,5 +1,6 @@
 use crate::Result;
 use crate::sync::Mutex;
+use crate::tree_store::SharedPageBytes;
 use crate::tree_store::page_store::cached_file::WritablePage;
 #[cfg(debug_assertions)]
 use crate::tree_store::page_store::fast_hash::PageNumberHashMap;
@@ -177,15 +178,25 @@ pub(crate) trait Page {
     fn get_page_number(&self) -> PageNumber;
 }
 
+// Every debug page has exactly one accounting owner. Fresh immutable context
+// copies cannot silently bypass tracking or enter the primary mutable-page map.
+#[cfg(debug_assertions)]
+#[derive(Clone)]
+pub(super) enum PageReadTracking {
+    Primary(Arc<Mutex<PageNumberHashMap<u64>>>),
+    #[cfg(not(redb_no_std))]
+    Copied(super::copied_page_metadata::SharedCopiedPageMetadata),
+}
+
 pub struct PageImpl {
-    pub(super) mem: Arc<[u8]>,
+    pub(super) mem: SharedPageBytes,
     pub(super) page_number: PageNumber,
     #[cfg(debug_assertions)]
-    pub(super) open_pages: Arc<Mutex<PageNumberHashMap<u64>>>,
+    pub(super) read_tracking: PageReadTracking,
 }
 
 impl PageImpl {
-    pub(crate) fn to_arc(&self) -> Arc<[u8]> {
+    pub(crate) fn to_arc(&self) -> SharedPageBytes {
         self.mem.clone()
     }
 }
@@ -199,12 +210,18 @@ impl Debug for PageImpl {
 #[cfg(debug_assertions)]
 impl Drop for PageImpl {
     fn drop(&mut self) {
-        let mut open_pages = self.open_pages.lock().unwrap();
-        let value = open_pages.get_mut(&self.page_number).unwrap();
-        assert!(*value > 0);
-        *value -= 1;
-        if *value == 0 {
-            open_pages.remove(&self.page_number);
+        match &self.read_tracking {
+            PageReadTracking::Primary(open_pages) => {
+                let mut open_pages = open_pages.lock().unwrap();
+                let value = open_pages.get_mut(&self.page_number).unwrap();
+                assert!(*value > 0);
+                *value -= 1;
+                if *value == 0 {
+                    open_pages.remove(&self.page_number);
+                }
+            }
+            #[cfg(not(redb_no_std))]
+            PageReadTracking::Copied(copied) => copied.release_reference(self.page_number),
         }
     }
 }
@@ -223,18 +240,23 @@ impl Clone for PageImpl {
     fn clone(&self) -> Self {
         #[cfg(debug_assertions)]
         {
-            *self
-                .open_pages
-                .lock()
-                .unwrap()
-                .get_mut(&self.page_number)
-                .unwrap() += 1;
+            match &self.read_tracking {
+                PageReadTracking::Primary(open_pages) => {
+                    *open_pages
+                        .lock()
+                        .unwrap()
+                        .get_mut(&self.page_number)
+                        .unwrap() += 1;
+                }
+                #[cfg(not(redb_no_std))]
+                PageReadTracking::Copied(copied) => copied.clone_reference(self.page_number),
+            }
         }
         Self {
             mem: self.mem.clone(),
             page_number: self.page_number,
             #[cfg(debug_assertions)]
-            open_pages: self.open_pages.clone(),
+            read_tracking: self.read_tracking.clone(),
         }
     }
 }
@@ -258,7 +280,7 @@ pub(crate) struct PageMut<'txn> {
     pub(super) page_number: PageNumber,
     pub(super) _lifetime: ScopedBorrow<'txn>,
     #[cfg(debug_assertions)]
-    pub(super) open_pages: Arc<Mutex<PageNumberHashSet>>,
+    pub(super) open_pages: Arc<Mutex<super::debug_page_set::NativeDebugPageSet>>,
 }
 
 impl PageMut<'_> {

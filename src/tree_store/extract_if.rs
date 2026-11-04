@@ -1,9 +1,11 @@
+use super::fixed_scratch::ScratchVec;
 use crate::sync::Mutex;
+use crate::tree_store::NativeOwnedPageVec;
+use crate::tree_store::NativeOwnedShared;
 use crate::tree_store::btree_cursor::RangeMut;
 use crate::tree_store::{BtreeHeader, PageAllocator, PageNumber, PageTracker};
 use crate::types::{Key, Value};
 use crate::{AccessGuard, Result, StorageError};
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Bound;
 
@@ -42,8 +44,28 @@ where
         front_bound: Bound<Vec<u8>>,
         back_bound: Bound<Vec<u8>>,
         predicate: F,
-        master_free_list: Arc<Mutex<Vec<PageNumber>>>,
-        allocated: Arc<PageTracker>,
+        master_free_list: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+        allocated: NativeOwnedShared<PageTracker>,
+        page_allocator: PageAllocator,
+    ) -> Self {
+        Self::new_prepared_bounds(
+            root,
+            front_bound.map(ScratchVec::ordinary),
+            back_bound.map(ScratchVec::ordinary),
+            predicate,
+            master_free_list,
+            allocated,
+            page_allocator,
+        )
+    }
+
+    pub(in crate::tree_store) fn new_prepared_bounds(
+        root: &'a mut Option<BtreeHeader>,
+        front_bound: Bound<ScratchVec<u8>>,
+        back_bound: Bound<ScratchVec<u8>>,
+        predicate: F,
+        master_free_list: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+        allocated: NativeOwnedShared<PageTracker>,
         page_allocator: PageAllocator,
     ) -> Self {
         Self {

@@ -2,6 +2,7 @@ use crate::BackendError;
 use crate::io;
 use crate::transaction_tracker::{TransactionId, TransactionTracker};
 use crate::transactions::AllocatorStateLatch;
+use crate::tree_store::NativeOwnedShared;
 #[cfg(not(redb_no_std))]
 use crate::tree_store::ReadOnlyBackend;
 use crate::tree_store::{
@@ -423,6 +424,16 @@ pub(crate) struct WriteSlot {
 }
 
 impl WriteSlot {
+    // The constructor-private tracker claim already owns Initializing. Keep the
+    // ordinary slot destructor and deferred-close handoff on every later error.
+    pub(crate) fn from_resource_claim(
+        claim: crate::transaction_tracker::NativeResourceSlotClaim,
+    ) -> Self {
+        Self {
+            tracker: claim.into_tracker(),
+        }
+    }
+
     fn take(tracker: Arc<TransactionTracker>) -> Self {
         tracker.take_write_slot();
         Self { tracker }
@@ -437,6 +448,30 @@ impl Drop for WriteSlot {
     }
 }
 
+// Native SYSTEM inspection is not a write transaction. The closed tracker
+// claim is the only constructor; every SYSTEM graph must drop ahead of this.
+pub(crate) struct NativeSystemInspectionLease {
+    claim: Option<crate::transaction_tracker::NativeSystemInspectionClaim>,
+}
+impl NativeSystemInspectionLease {
+    pub(crate) fn from_claim(
+        claim: crate::transaction_tracker::NativeSystemInspectionClaim,
+    ) -> Self {
+        Self { claim: Some(claim) }
+    }
+}
+impl Drop for NativeSystemInspectionLease {
+    fn drop(&mut self) {
+        let Some(claim) = self.claim.take() else {
+            return;
+        };
+        let tracker = claim.actual_tracker().clone();
+        if let Some(mem) = tracker.end_system_inspection(claim) {
+            close_database(&tracker, &mem);
+        }
+    }
+}
+
 pub(crate) enum TransactionGuard {
     Read {
         tracker: Arc<TransactionTracker>,
@@ -445,6 +480,13 @@ pub(crate) enum TransactionGuard {
         // needs to release it. `None` when a savepoint becomes persistent: the database
         // owns the reference from then on and releases it when the savepoint is deleted
         reference: Option<Arc<TransactionalMemory>>,
+    },
+    #[cfg(not(redb_no_std))]
+    PlannedRead {
+        tracker: Arc<TransactionTracker>,
+        transaction_id: TransactionId,
+        serial: u64,
+        reference: Arc<TransactionalMemory>,
     },
     Write {
         transaction_id: TransactionId,
@@ -458,7 +500,82 @@ pub(crate) enum TransactionGuard {
     Untracked,
 }
 
+// Private native lifetime proof; no raw root, registration tuple or Source fact.
+pub(crate) struct CheckedPinnedReadParts<'guard> {
+    guard: &'guard TransactionGuard,
+}
+impl CheckedPinnedReadParts<'_> {
+    pub(crate) fn actual_tracker(&self) -> &Arc<TransactionTracker> {
+        self.guard.tracker()
+    }
+    pub(crate) fn transaction_id(&self) -> TransactionId {
+        self.guard.id()
+    }
+    pub(crate) fn actual_memory(&self) -> &Arc<TransactionalMemory> {
+        match self.guard {
+            TransactionGuard::Read {
+                reference: Some(memory),
+                ..
+            } => memory,
+            #[cfg(not(redb_no_std))]
+            TransactionGuard::PlannedRead { reference, .. } => reference,
+            TransactionGuard::Read {
+                reference: None, ..
+            }
+            | TransactionGuard::Write { .. }
+            | TransactionGuard::Untracked => {
+                unreachable!("only a checked owning read guard mints native pin parts")
+            }
+        }
+    }
+}
+
 impl TransactionGuard {
+    // Actual native memory/slot affinity, not a caller-provided ID tuple.
+    pub(crate) fn is_exclusive_writer_for(
+        &self,
+        memory: &TransactionalMemory,
+        tracker: &TransactionTracker,
+    ) -> bool {
+        match self {
+            Self::Write {
+                _writer_lock, slot, ..
+            } => {
+                core::ptr::eq(tracker, slot.tracker.as_ref())
+                    && memory.owns_exclusive_writer_lock(_writer_lock)
+            }
+            _ => false,
+        }
+    }
+    pub(crate) fn checked_pinned_read_parts(
+        &self,
+    ) -> core::result::Result<
+        Option<CheckedPinnedReadParts<'_>>,
+        crate::transaction_tracker::NativeResourcePlanningRefusal,
+    > {
+        match self {
+            Self::Read {
+                reference: Some(_), ..
+            } => {}
+            #[cfg(not(redb_no_std))]
+            Self::PlannedRead {
+                tracker,
+                transaction_id,
+                serial,
+                reference,
+            } => {
+                tracker.require_planned_read_pin(reference, *transaction_id, *serial)?;
+            }
+            Self::Read {
+                reference: None, ..
+            }
+            | Self::Write { .. }
+            | Self::Untracked => {
+                return Ok(None);
+            }
+        }
+        Ok(Some(CheckedPinnedReadParts { guard: self }))
+    }
     pub(crate) fn new_read(
         transaction_id: TransactionId,
         tracker: Arc<TransactionTracker>,
@@ -500,6 +617,8 @@ impl TransactionGuard {
     pub(crate) fn tracker(&self) -> &Arc<TransactionTracker> {
         match self {
             Self::Read { tracker, .. } => tracker,
+            #[cfg(not(redb_no_std))]
+            Self::PlannedRead { tracker, .. } => tracker,
             Self::Write { slot, .. } => &slot.tracker,
             Self::Untracked => unreachable!("an untracked guard has no tracker"),
         }
@@ -515,6 +634,26 @@ impl TransactionGuard {
         Ok((Self::new_read(id, tracker, mem), root))
     }
 
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn allocate_planned_read(
+        tracker: Arc<TransactionTracker>,
+        mem: &Arc<TransactionalMemory>,
+        snapshot: &crate::transaction_tracker::NativePlannedReadSnapshot<'_>,
+    ) -> core::result::Result<
+        (Self, Option<BtreeHeader>),
+        crate::transaction_tracker::NativePlannedReadError,
+    > {
+        let (transaction_id, root, serial) = tracker.register_planned_read(mem, snapshot)?;
+        Ok((
+            Self::PlannedRead {
+                tracker,
+                transaction_id,
+                serial,
+                reference: mem.clone(),
+            },
+            root,
+        ))
+    }
     pub(crate) fn new_write(
         transaction_id: TransactionId,
         slot: WriteSlot,
@@ -536,6 +675,8 @@ impl TransactionGuard {
             Self::Read { transaction_id, .. } | Self::Write { transaction_id, .. } => {
                 *transaction_id
             }
+            #[cfg(not(redb_no_std))]
+            Self::PlannedRead { transaction_id, .. } => *transaction_id,
             Self::Untracked => {
                 panic!("TransactionGuard::id() called on an untracked guard")
             }
@@ -554,6 +695,15 @@ impl Drop for TransactionGuard {
                 if let Some(mem) = reference {
                     tracker.deallocate_read_transaction(mem, *transaction_id);
                 }
+            }
+            #[cfg(not(redb_no_std))]
+            Self::PlannedRead {
+                tracker,
+                transaction_id,
+                serial,
+                reference,
+            } => {
+                tracker.deallocate_planned_read(reference, *transaction_id, *serial);
             }
             Self::Write { slot, .. } => {
                 // Leave `Live` before the fields drop the writer lock and then the slot.
@@ -629,6 +779,8 @@ pub trait ReadableDatabase: SealedInApi5 {
 /// ```
 #[cfg(not(redb_no_std))]
 pub struct ReadOnlyDatabase {
+    reopen_custody: Option<read_only_reopen_custody::ReadOnlyReopenFileCustody>,
+    page_resources: Option<crate::tree_store::NativePageResources>,
     mem: Arc<TransactionalMemory>,
     transaction_tracker: Arc<TransactionTracker>,
 }
@@ -667,11 +819,31 @@ impl ReadOnlyDatabase {
         cache_size: usize,
         concurrency_mode: ConcurrencyMode,
     ) -> Result<Self, DatabaseError> {
+        Self::new_read_resources(
+            file,
+            page_size,
+            region_size,
+            cache_size,
+            concurrency_mode,
+            None,
+            None,
+        )
+    }
+
+    fn new_read_resources(
+        file: Box<dyn StorageBackend>,
+        page_size: usize,
+        region_size: Option<u64>,
+        cache_size: usize,
+        concurrency_mode: ConcurrencyMode,
+        page_resources: Option<crate::tree_store::NativePageResources>,
+        read_resource_profile: Option<crate::tree_store::ReadOnlyResourceProfile>,
+    ) -> Result<Self, DatabaseError> {
         #[cfg(feature = "logging")]
         let file_path = format!("{:?}", &file);
         #[cfg(feature = "logging")]
         debug!("Opening database in read-only {:?}", &file_path);
-        let (mem, _writer_lock) = TransactionalMemory::new(
+        let (mem, _writer_lock) = TransactionalMemory::new_read_resources(
             Box::new(ReadOnlyBackend::new(file)),
             false,
             page_size,
@@ -679,6 +851,8 @@ impl ReadOnlyDatabase {
             cache_size,
             true,
             concurrency_mode,
+            page_resources.clone(),
+            read_resource_profile,
         )?;
         let mem = Arc::new(mem);
         // A reader beside a multi-process writer never allocates, so it loads no allocator state
@@ -700,6 +874,8 @@ impl ReadOnlyDatabase {
         let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
         let db = Self {
             mem,
+            reopen_custody: None,
+            page_resources,
             transaction_tracker: Arc::new(TransactionTracker::new(next_transaction_id)),
         };
 
@@ -773,6 +949,91 @@ impl ReadableDatabase for Database {
 }
 
 impl Database {
+    // The returned epoch borrows this actual Database owner. It exposes no
+    // tracker/guard, mutation authority or complete native resource plan.
+    pub(crate) fn capture_native_resource_epoch(
+        &self,
+    ) -> core::result::Result<
+        crate::transaction_tracker::NativeResourceEpoch<'_>,
+        crate::transaction_tracker::NativeResourcePlanningRefusal,
+    > {
+        self.transaction_tracker.capture_resource_epoch()
+    }
+
+    // Native unit fixture, never a public/full writer constructor. Actual
+    // tracker CAS and writer lock mint the real write ID/guard, and the chosen
+    // Source allocator reaches both namespaces before their first page fetch.
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn begin_point_payload_write_for_test(
+        &self,
+        epoch: crate::transaction_tracker::NativeResourceEpoch<'_>,
+        limits: crate::tree_store::NativeReadLimits,
+        total_requests: usize,
+    ) -> core::result::Result<
+        (WriteTransaction, crate::tree_store::NativePageResources),
+        crate::tree_store::NativeKeyPathError,
+    > {
+        self.begin_point_payload_write_with_controls_for_test(epoch, limits, total_requests, 0)
+    }
+
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn begin_point_payload_write_with_controls_for_test(
+        &self,
+        epoch: crate::transaction_tracker::NativeResourceEpoch<'_>,
+        limits: crate::tree_store::NativeReadLimits,
+        total_requests: usize,
+        fixture_cache_controls: usize,
+    ) -> core::result::Result<
+        (WriteTransaction, crate::tree_store::NativePageResources),
+        crate::tree_store::NativeKeyPathError,
+    > {
+        use crate::tree_store::NativeKeyPathError as E;
+        epoch
+            .require_tracker(&self.transaction_tracker)
+            .map_err(E::Epoch)?;
+        if self.mem.concurrency_mode() != ConcurrencyMode::ExclusiveWriter {
+            return Err(E::UnsupportedState);
+        }
+        self.mem.check_io_errors()?;
+        let fixture_controls = WriteTransaction::point_payload_shared_controls_for_test()?
+            .checked_add(fixture_cache_controls)
+            .ok_or_else(crate::tree_store::source_owner_refused)?;
+        let context = crate::tree_store::NativeReadContext::new_fixed_write_for_test(
+            limits,
+            total_requests,
+            fixture_controls,
+        )?;
+        let resources = context.resources.clone();
+        let slot = self
+            .transaction_tracker
+            .try_claim_resource_write_slot(epoch)
+            .map_err(E::Epoch)?;
+        let writer_lock = self.mem.lock_writer()?;
+        // ExclusiveWriter must not acquire a new external head. Reuse the sole
+        // native synchronization owner and refuse an unexpected sync profile.
+        let latch = sync_to_latest_commit(&self.mem, &writer_lock, None)?;
+        if latch.is_some() {
+            return Err(E::UnsupportedState);
+        }
+        self.mem.check_io_errors()?;
+        if self.mem.allocator_state_invalidated() {
+            return Err(E::UnsupportedState);
+        }
+        let id = self.transaction_tracker.issue_write_transaction_id(
+            self.mem.get_last_committed_transaction_id()?,
+            &writer_lock,
+        );
+        let guard = TransactionGuard::new_write(id, slot, writer_lock);
+        let transaction = WriteTransaction::new_for_point_payload_test(
+            guard,
+            self.transaction_tracker.clone(),
+            self.mem.clone(),
+            context,
+            total_requests,
+        )?;
+        Ok((transaction, resources))
+    }
+
     /// Opens the specified file as a redb database.
     /// * if the file does not exist, or is an empty file, a new database will be initialized in it
     /// * if the file is a valid redb database, it will be opened
@@ -809,7 +1070,7 @@ impl Database {
         let table_tree = TableTree::new(
             data_root,
             PageHint::None,
-            Arc::new(TransactionGuard::untracked()),
+            NativeOwnedShared::ordinary(TransactionGuard::untracked()),
             resolver.clone(),
         )?;
         if !table_tree.verify_checksums()? {
@@ -818,7 +1079,7 @@ impl Database {
         let system_table_tree = TableTree::new(
             system_root,
             PageHint::None,
-            Arc::new(TransactionGuard::untracked()),
+            NativeOwnedShared::ordinary(TransactionGuard::untracked()),
             resolver,
         )?;
         if !system_table_tree.verify_checksums()? {
@@ -1250,7 +1511,7 @@ impl Database {
         let table_tree = TableTree::new(
             system_root,
             PageHint::None,
-            Arc::new(TransactionGuard::untracked()),
+            NativeOwnedShared::ordinary(TransactionGuard::untracked()),
             resolver.clone(),
         )?;
         if let Some(table_def) = table_tree
@@ -1267,7 +1528,7 @@ impl Database {
                 DATA_ALLOCATED_TABLE.name().to_string(),
                 table_root,
                 PageHint::None,
-                Arc::new(TransactionGuard::untracked()),
+                NativeOwnedShared::ordinary(TransactionGuard::untracked()),
                 resolver,
             )?;
             for result in ReadableTable::iter(&table)? {
@@ -1290,7 +1551,7 @@ impl Database {
     where
         F: FnMut(PageNumber) -> Result,
     {
-        let untracked_guard = Arc::new(TransactionGuard::untracked());
+        let untracked_guard = NativeOwnedShared::ordinary(TransactionGuard::untracked());
         let resolver = PageResolver::new(mem.clone());
         let system_tree = TableTree::new(
             system_root,
@@ -1324,7 +1585,7 @@ impl Database {
                     table_name.to_string(),
                     table_root,
                     PageHint::None,
-                    Arc::new(TransactionGuard::untracked()),
+                    NativeOwnedShared::ordinary(TransactionGuard::untracked()),
                     resolver,
                 )?;
             for result in ReadableTable::iter(&table)? {
@@ -1342,7 +1603,7 @@ impl Database {
     fn mark_allocated_page_for_debug(mem: &Arc<TransactionalMemory>) -> Result {
         let data_root = mem.get_data_root();
         {
-            let untracked = Arc::new(TransactionGuard::untracked());
+            let untracked = NativeOwnedShared::ordinary(TransactionGuard::untracked());
             let tables = TableTree::new(
                 data_root,
                 PageHint::None,
@@ -1357,7 +1618,7 @@ impl Database {
 
         let system_root = mem.get_system_root();
         {
-            let untracked = Arc::new(TransactionGuard::untracked());
+            let untracked = NativeOwnedShared::ordinary(TransactionGuard::untracked());
             let system_tables = TableTree::new(
                 system_root,
                 PageHint::None,
@@ -1458,7 +1719,7 @@ impl Database {
 
         let data_root = {
             let root = mem.get_data_root();
-            let untracked = Arc::new(TransactionGuard::untracked());
+            let untracked = NativeOwnedShared::ordinary(TransactionGuard::untracked());
             let tables = TableTree::new(
                 root,
                 PageHint::None,
@@ -1478,7 +1739,7 @@ impl Database {
 
         let system_root = {
             let root = mem.get_system_root();
-            let untracked = Arc::new(TransactionGuard::untracked());
+            let untracked = NativeOwnedShared::ordinary(TransactionGuard::untracked());
             let system_tables = TableTree::new(
                 root,
                 PageHint::None,
@@ -1650,12 +1911,26 @@ impl Database {
         let system_table_tree = TableTree::new(
             mem.get_system_root(),
             PageHint::None,
-            Arc::new(TransactionGuard::untracked()),
+            NativeOwnedShared::ordinary(TransactionGuard::untracked()),
             resolver.clone(),
         )?;
-        let Some(allocator_state_table) = system_table_tree
-            .get_table::<AllocatorStateKey, &[u8]>(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
-            .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?
+        #[cfg(not(redb_no_std))]
+        let definition = if mem.is_prepaid_read_construction() {
+            system_table_tree.get_table_prepaid::<AllocatorStateKey, &[u8]>(
+                ALLOCATOR_STATE_TABLE_NAME,
+                TableType::Normal,
+            )
+        } else {
+            system_table_tree.get_table::<AllocatorStateKey, &[u8]>(
+                ALLOCATOR_STATE_TABLE_NAME,
+                TableType::Normal,
+            )
+        };
+        #[cfg(redb_no_std)]
+        let definition = system_table_tree
+            .get_table::<AllocatorStateKey, &[u8]>(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal);
+        let Some(allocator_state_table) =
+            definition.map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?
         else {
             return Ok(None);
         };
@@ -1667,7 +1942,7 @@ impl Database {
         let tree = AllocatorStateTree::new(
             table_root,
             PageHint::None,
-            Arc::new(TransactionGuard::untracked()),
+            NativeOwnedShared::ordinary(TransactionGuard::untracked()),
             resolver,
         )?;
 
@@ -4403,4 +4678,188 @@ mod active_transaction_test {
         assert!(probe.try_lock_range(byte_range(WRITER_BYTE)).unwrap());
         probe.unlock_range(byte_range(WRITER_BYTE)).unwrap();
     }
+}
+
+#[cfg(all(test, not(redb_no_std)))]
+#[path = "native_resource_generation_tests.rs"]
+mod native_resource_generation_tests;
+
+#[cfg(all(test, not(redb_no_std)))]
+#[path = "native_allocator_reopen_tests.rs"]
+mod native_allocator_reopen_tests;
+
+#[cfg(not(redb_no_std))]
+#[path = "read_only_reopen_custody.rs"]
+mod read_only_reopen_custody;
+
+#[cfg(not(redb_no_std))]
+#[path = "read_only_reopen.rs"]
+mod read_only_reopen;
+#[cfg(not(redb_no_std))]
+pub(crate) use read_only_reopen::{KEY_BYTES as PLANNED_READ_KEY_BYTES, PlannedHandleGate};
+#[cfg(not(redb_no_std))]
+pub use read_only_reopen::{
+    PlannedByteRange, PlannedBytesTable, PlannedKeyValue, PlannedReadOnlyDatabase,
+    PlannedReadTransaction, PlannedStrTable, PlannedValue, ReadOnlyPostHandoffCustody,
+    ReadOnlyReopenError, ReadOnlyReopenHandoff, ReadOnlyReopenResourcePlan,
+};
+
+#[cfg(all(test, not(redb_no_std)))]
+#[path = "native_resource_path_tests.rs"]
+mod native_resource_path_tests;
+
+#[cfg(not(redb_no_std))]
+#[path = "native_current_read.rs"]
+mod native_current_read;
+#[cfg(not(redb_no_std))]
+pub use native_current_read::NativeCurrentReadPlan;
+
+#[cfg(not(redb_no_std))]
+#[path = "native_system_binding.rs"]
+mod native_system_binding;
+#[cfg(not(redb_no_std))]
+pub(crate) use native_system_binding::NativePreparedSystemBinding;
+
+#[cfg(not(redb_no_std))]
+#[path = "native_fixed_cleanup.rs"]
+mod native_fixed_cleanup;
+#[cfg(not(redb_no_std))]
+pub(crate) use native_fixed_cleanup::{
+    NativeFixedCleanupError, NativeFixedExecutionBufferDemand, NativeFixedExecutionBuffers,
+};
+#[cfg(not(redb_no_std))]
+pub(crate) use native_fixed_cleanup::{
+    NativeFixedCleanupFailure, NativeFixedWriterClaim, NativePreparedFixedCleanup,
+};
+
+#[cfg(all(test, not(redb_no_std)))]
+mod guarded_allocator_load_tests {
+    use super::*;
+    use crate::tree_store::NativePageResources;
+    use crate::{Durability, ReadableDatabase, TableDefinition};
+
+    const GUARDED_ALLOCATOR_TABLE: TableDefinition<u64, u64> =
+        TableDefinition::new("guarded-allocator-materialization");
+    fn genuine_allocator_file() -> tempfile::NamedTempFile {
+        let file = crate::create_tempfile();
+        let database = Database::create(file.path()).unwrap();
+        let mut write = database.begin_write().unwrap();
+        write.set_durability(Durability::Immediate).unwrap();
+        write.set_two_phase_commit(true);
+        write
+            .open_table(GUARDED_ALLOCATOR_TABLE)
+            .unwrap()
+            .insert(7, 11)
+            .unwrap();
+        write.commit().unwrap();
+        drop(database);
+        file
+    }
+
+    #[test]
+    // req: STO-020, REC-001
+    fn native_guarded_allocator_load_uses_real_persisted_tree_and_retains_actual_owner() {
+        let file = genuine_allocator_file();
+        let database = ReadOnlyDatabase::open(file.path()).unwrap();
+        let tree = Database::get_allocator_state_table(&database.mem)
+            .unwrap()
+            .unwrap();
+        let before = database.mem.allocator_hash();
+        let (_, parse_peak) = database.mem.inspect_allocator_state_source(&tree).unwrap();
+        let (_, retained_upper, complete_peak) = database
+            .mem
+            .inspect_allocator_state_source_reopen(&tree)
+            .unwrap();
+        let resources = NativePageResources::from_retained_pool_data(
+            usize::try_from(complete_peak).unwrap(),
+            (),
+        )
+        .unwrap();
+        database
+            .mem
+            .load_allocator_state_source(&tree, &resources)
+            .unwrap();
+        assert_eq!(database.mem.allocator_hash(), before);
+        let read = database.begin_read().unwrap();
+        assert_eq!(
+            read.open_table(GUARDED_ALLOCATOR_TABLE)
+                .unwrap()
+                .get_owned(7)
+                .unwrap()
+                .unwrap()
+                .value(),
+            11
+        );
+        assert!(resources.current() > 0);
+        assert_eq!(
+            resources.admitted_high_water_for_test(),
+            usize::try_from(parse_peak).unwrap()
+        );
+        assert!(resources.admitted_high_water_for_test() as u64 <= complete_peak);
+        assert!(resources.current() as u64 <= retained_upper);
+        drop(tree);
+        drop(database);
+        // The actual native read retains TransactionalMemory and its guarded
+        // allocator graph; bare wrapper retirement cannot refund those buffers.
+        assert!(resources.current() > 0);
+        drop(read);
+        assert_eq!(resources.current(), 0);
+    }
+
+    #[test]
+    // req: STO-020, REC-001
+    fn native_guarded_allocator_load_n_minus_one_leaves_old_owner_intact_and_refunds() {
+        let file = genuine_allocator_file();
+        let database = ReadOnlyDatabase::open(file.path()).unwrap();
+        let tree = Database::get_allocator_state_table(&database.mem)
+            .unwrap()
+            .unwrap();
+        let before = database.mem.allocator_hash();
+        let before_facts = database.mem.allocator_reopen_component().unwrap().facts();
+        let (_, parse_peak) = database.mem.inspect_allocator_state_source(&tree).unwrap();
+        let resources = NativePageResources::from_retained_pool_data(
+            usize::try_from(parse_peak).unwrap() - 1,
+            (),
+        )
+        .unwrap();
+        assert!(
+            database
+                .mem
+                .load_allocator_state_source(&tree, &resources)
+                .is_err()
+        );
+        assert_eq!(resources.current(), 0);
+        assert!(resources.admitted_high_water_for_test() > 0);
+        assert_eq!(database.mem.allocator_hash(), before);
+        assert_eq!(
+            database.mem.allocator_reopen_component().unwrap().facts(),
+            before_facts
+        );
+        assert_eq!(
+            database
+                .begin_read()
+                .unwrap()
+                .open_table(GUARDED_ALLOCATOR_TABLE)
+                .unwrap()
+                .get_owned(7)
+                .unwrap()
+                .unwrap()
+                .value(),
+            11
+        );
+        drop(tree);
+        drop(database);
+        assert_eq!(resources.current(), 0);
+    }
+}
+
+#[cfg(not(redb_no_std))]
+pub(crate) fn cold_read_backend_box_capacity_bytes()
+-> Result<u64, crate::tree_store::AllocatorResourceError> {
+    use crate::tree_store::ReadOnlyResourceProfile as P;
+    P::typed_allocation::<ReadOnlyBackend>()?
+        .checked_add(P::typed_allocation::<
+            read_only_reopen_custody::ReadOnlyReopenBackend,
+        >()?)
+        .ok_or(crate::tree_store::AllocatorResourceError::Overflow)
 }

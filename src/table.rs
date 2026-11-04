@@ -3,6 +3,8 @@ use crate::KeyRange;
 use crate::db::TransactionGuard;
 use crate::sealed::Sealed;
 use crate::sync::Mutex;
+use crate::tree_store::NativeOwnedPageVec;
+use crate::tree_store::NativeOwnedShared;
 #[cfg(not(feature = "experimental-api-5"))]
 use crate::tree_store::encode_bounds;
 use crate::tree_store::{
@@ -15,7 +17,6 @@ use crate::{AccessGuard, AccessGuardMut, CursorError, StorageError, WriteTransac
 use crate::{Result, TableHandle};
 use alloc::string::String;
 use alloc::string::ToString;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::borrow::Borrow;
 use core::fmt::{Debug, Formatter};
@@ -71,7 +72,7 @@ impl TableStats {
 
 /// A table containing key-value mappings
 pub struct Table<'txn, K: Key + 'static, V: Value + 'static> {
-    name: String,
+    name: crate::tree_store::NativeTableName,
     transaction: &'txn WriteTransaction,
     tree: BtreeMut<K, V>,
 }
@@ -112,13 +113,31 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
     pub(crate) fn new(
         name: &str,
         table_root: Option<BtreeHeader>,
-        freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-        allocated_pages: Arc<PageTracker>,
+        freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+        allocated_pages: NativeOwnedShared<PageTracker>,
+        page_allocator: PageAllocator,
+        transaction: &'txn WriteTransaction,
+    ) -> Table<'txn, K, V> {
+        Self::new_with_owned_name(
+            crate::tree_store::NativeTableName::ordinary(name),
+            table_root,
+            freed_pages,
+            allocated_pages,
+            page_allocator,
+            transaction,
+        )
+    }
+
+    pub(crate) fn new_with_owned_name(
+        name: crate::tree_store::NativeTableName,
+        table_root: Option<BtreeHeader>,
+        freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+        allocated_pages: NativeOwnedShared<PageTracker>,
         page_allocator: PageAllocator,
         transaction: &'txn WriteTransaction,
     ) -> Table<'txn, K, V> {
         Table {
-            name: name.to_string(),
+            name,
             transaction,
             tree: BtreeMut::new(
                 table_root,
@@ -128,6 +147,13 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
                 allocated_pages,
             ),
         }
+    }
+
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn alias_first_root_child_for_point_frontier_test(
+        &mut self,
+    ) -> Result<Option<Vec<u8>>> {
+        self.tree.alias_first_root_child_for_point_frontier_test()
     }
 
     #[allow(dead_code)]
@@ -801,7 +827,7 @@ pub trait ReadableTable<K: Key + 'static, V: Value + 'static>: ReadableTableMeta
 pub struct ReadOnlyUntypedTable {
     name: String,
     tree: RawBtree,
-    _transaction_guard: Arc<TransactionGuard>,
+    _transaction_guard: NativeOwnedShared<TransactionGuard>,
 }
 
 impl Sealed for ReadOnlyUntypedTable {}
@@ -838,7 +864,7 @@ impl ReadOnlyUntypedTable {
         root_page: Option<BtreeHeader>,
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
-        guard: Arc<TransactionGuard>,
+        guard: NativeOwnedShared<TransactionGuard>,
         mem: PageResolver,
     ) -> Self {
         Self {
@@ -859,7 +885,7 @@ impl ReadOnlyUntypedTable {
 pub struct ReadOnlyTable<K: Key + 'static, V: Value + 'static> {
     name: String,
     tree: Btree<K, V>,
-    transaction_guard: Arc<TransactionGuard>,
+    transaction_guard: NativeOwnedShared<TransactionGuard>,
 }
 
 impl<K: Key + 'static, V: Value + 'static> TableHandle for ReadOnlyTable<K, V> {
@@ -869,11 +895,77 @@ impl<K: Key + 'static, V: Value + 'static> TableHandle for ReadOnlyTable<K, V> {
 }
 
 impl<K: Key + 'static, V: Value + 'static> ReadOnlyTable<K, V> {
+    pub(crate) fn prepare_owned_point_frontier<'tree, 'recipe, 'tracker>(
+        &'tree self,
+        recipe: &'recipe crate::tree_store::NativePointRecipe<'recipe>,
+        epoch: crate::transaction_tracker::NativeResourceEpoch<'tracker>,
+    ) -> Result<
+        crate::tree_store::NativeOwnedPointFrontierPreparation<'tree, 'recipe, 'tracker, K, V>,
+        crate::tree_store::NativeKeyPathError,
+    > {
+        self.tree
+            .prepare_owned_point_frontier(&self.name, recipe, epoch)
+    }
+    pub(crate) fn validate_owned_point_frontier(
+        &self,
+        facts: &crate::tree_store::NativeOwnedPointFrontierFacts<'_, '_>,
+        actual_recipe: &crate::tree_store::NativePointRecipe<'_>,
+    ) -> Result<(), crate::tree_store::NativeKeyPathError> {
+        facts.validate_same_current_tree(&self.tree, &self.name, actual_recipe)
+    }
+    pub(crate) fn validate_point_frontier(
+        &self,
+        facts: &crate::tree_store::NativePointFrontierFacts<'_, '_>,
+    ) -> Result<(), crate::tree_store::NativeKeyPathError> {
+        facts.validate_same_current_tree(&self.tree, &self.name)
+    }
+    pub(crate) fn prepare_point_frontier<'tree, 'recipe, 'epoch, 'tracker>(
+        &'tree self,
+        recipe: &'recipe crate::tree_store::NativePointRecipe<'recipe>,
+        epoch: &'epoch crate::transaction_tracker::NativeResourceEpoch<'tracker>,
+    ) -> Result<
+        crate::tree_store::NativePointFrontierPreparation<'tree, 'recipe, 'epoch, 'tracker, K, V>,
+        crate::tree_store::NativeKeyPathError,
+    > {
+        self.tree.prepare_point_frontier(&self.name, recipe, epoch)
+    }
+
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn context_current_for_test(&self) -> usize {
+        self.tree.context_current_for_test()
+    }
+    // Numerical inspection on this actual owned native read pin. The complete
+    // resource owner must already admit this table/root/page/control graph.
+    pub(crate) fn inspect_prepared_resource_key<'tree, 'epoch, 'tracker>(
+        &'tree self,
+        key: &crate::tree_store::NativePreparedNormalKey<'_>,
+        epoch: &'epoch crate::transaction_tracker::NativeResourceEpoch<'tracker>,
+        visits: &mut crate::tree_store::CompiledPathVisits,
+    ) -> Result<
+        crate::tree_store::NativeEpochKeyPath<'tree, 'epoch, 'tracker, K, V>,
+        crate::tree_store::NativeKeyPathError,
+    > {
+        self.tree
+            .inspect_prepared_resource_key_at_epoch(key, epoch, visits)
+    }
+
+    pub(crate) fn inspect_prepared_resource_keys<'tree, 'keys, 'epoch, 'tracker>(
+        &'tree self,
+        keys: &'keys [crate::tree_store::NativePreparedNormalKey<'keys>],
+        epoch: &'epoch crate::transaction_tracker::NativeResourceEpoch<'tracker>,
+    ) -> Result<
+        crate::tree_store::NativeEpochKeyBatch<'tree, 'keys, 'epoch, 'tracker, K, V>,
+        crate::tree_store::NativeKeyPathError,
+    > {
+        self.tree
+            .inspect_prepared_resource_keys_at_epoch(keys, epoch)
+    }
+
     pub(crate) fn new(
         name: String,
         root_page: Option<BtreeHeader>,
         hint: PageHint,
-        guard: Arc<TransactionGuard>,
+        guard: NativeOwnedShared<TransactionGuard>,
         mem: PageResolver,
     ) -> Result<ReadOnlyTable<K, V>> {
         Ok(ReadOnlyTable {
@@ -1130,13 +1222,16 @@ pub(crate) type CompatBorrow<'a> = PhantomData<&'a ()>;
 #[derive(Clone)]
 pub struct Range<'a, K: Key + 'static, V: Value + 'static> {
     inner: BtreeCursorRange<K, V>,
-    _transaction_guard: Arc<TransactionGuard>,
+    _transaction_guard: NativeOwnedShared<TransactionGuard>,
     // Keeps the table borrowed for as long as the range is alive; see `ScopedBorrow`
     _lifetime: CompatBorrow<'a>,
 }
 
 impl<K: Key + 'static, V: Value + 'static> Range<'_, K, V> {
-    pub(super) fn new(inner: BtreeCursorRange<K, V>, guard: Arc<TransactionGuard>) -> Self {
+    pub(super) fn new(
+        inner: BtreeCursorRange<K, V>,
+        guard: NativeOwnedShared<TransactionGuard>,
+    ) -> Self {
         Self {
             inner,
             _transaction_guard: guard,
@@ -1208,11 +1303,14 @@ pub struct OwnedAccessGuard<V: Value + 'static> {
     // Declared before the transaction guard so the page reference is released before the
     // transaction is deallocated
     inner: AccessGuard<'static, V>,
-    _transaction_guard: Arc<TransactionGuard>,
+    _transaction_guard: NativeOwnedShared<TransactionGuard>,
 }
 
 impl<V: Value + 'static> OwnedAccessGuard<V> {
-    pub(crate) fn new(inner: AccessGuard<'static, V>, guard: Arc<TransactionGuard>) -> Self {
+    pub(crate) fn new(
+        inner: AccessGuard<'static, V>,
+        guard: NativeOwnedShared<TransactionGuard>,
+    ) -> Self {
         Self {
             inner,
             _transaction_guard: guard,
@@ -1232,11 +1330,14 @@ impl<V: Value + 'static> OwnedAccessGuard<V> {
 #[derive(Clone)]
 pub struct OwnedRange<K: Key + 'static, V: Value + 'static> {
     inner: Range<'static, K, V>,
-    transaction_guard: Arc<TransactionGuard>,
+    transaction_guard: NativeOwnedShared<TransactionGuard>,
 }
 
 impl<K: Key + 'static, V: Value + 'static> OwnedRange<K, V> {
-    pub(super) fn new(inner: Range<'static, K, V>, guard: Arc<TransactionGuard>) -> Self {
+    pub(super) fn new(
+        inner: Range<'static, K, V>,
+        guard: NativeOwnedShared<TransactionGuard>,
+    ) -> Self {
         Self {
             inner,
             transaction_guard: guard,
@@ -1499,7 +1600,7 @@ pub struct Cursor<'a, K: Key + 'static, V: Value + 'static> {
     inner: BtreeCursor<K, V>,
     // The cursor owns page handles, so it keeps the transaction registered for as long as it is
     // alive
-    _transaction_guard: Arc<TransactionGuard>,
+    _transaction_guard: NativeOwnedShared<TransactionGuard>,
     // Keeps the table borrowed for as long as the cursor is alive, so that it cannot be mutated
     // while the cursor holds its pages; see `ScopedBorrow`. The lifetime also bounds the guards
     // the cursor yields, which is why there is no `'static` cursor: such a guard could outlive
@@ -1508,7 +1609,10 @@ pub struct Cursor<'a, K: Key + 'static, V: Value + 'static> {
 }
 
 impl<K: Key + 'static, V: Value + 'static> Cursor<'_, K, V> {
-    pub(crate) fn new(inner: BtreeCursor<K, V>, guard: Arc<TransactionGuard>) -> Self {
+    pub(crate) fn new(
+        inner: BtreeCursor<K, V>,
+        guard: NativeOwnedShared<TransactionGuard>,
+    ) -> Self {
         Self {
             inner,
             _transaction_guard: guard,
@@ -1901,5 +2005,26 @@ impl<K: Key + 'static, V: Value + 'static> Drop for CursorMut<'_, K, V> {
         // Drop cannot surface a splice failure; finish() poisons the
         // transaction instead, so the loss cannot be committed.
         let _ = self.finish();
+    }
+}
+
+#[cfg(all(test, not(redb_no_std)))]
+#[path = "native_point_frontier_tests.rs"]
+mod native_point_frontier_tests;
+
+#[cfg(all(test, not(redb_no_std)))]
+#[path = "native_point_payload_tests.rs"]
+mod native_point_payload_tests;
+
+#[cfg(all(test, not(redb_no_std)))]
+#[path = "native_owned_tracking_tests.rs"]
+mod native_owned_tracking_tests;
+
+#[cfg(all(test, not(redb_no_std)))]
+impl Table<'_, u128, &[u8]> {
+    pub(crate) fn fixed_phase_user_leaf_shapes_for_fixture(
+        &self,
+    ) -> Result<Option<[(usize, usize, [(u128, usize); 8]); 8]>> {
+        self.tree.fixed_phase_user_leaf_shapes_for_fixture()
     }
 }

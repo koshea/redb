@@ -38,15 +38,26 @@ impl TypeClassification {
         }
     }
 
-    fn from_byte(value: u8) -> Self {
+    fn try_from_byte(value: u8) -> Option<Self> {
         match value {
-            1 => TypeClassification::Internal,
-            2 => TypeClassification::UserDefined,
-            3 => TypeClassification::Internal2,
-            4 => TypeClassification::Internal3,
-            _ => unreachable!(),
+            1 => Some(TypeClassification::Internal),
+            2 => Some(TypeClassification::UserDefined),
+            3 => Some(TypeClassification::Internal2),
+            4 => Some(TypeClassification::Internal3),
+            _ => None,
         }
     }
+}
+
+// Closed native resource schema metadata. Each name is also the SINGLE source
+// used by its existing Value::type_name; this grants no storage/source authority.
+pub(crate) trait NativeResourceTypeName: Value {
+    const INTERNAL_RESOURCE_NAME: &'static str;
+}
+#[derive(Debug)]
+pub(crate) enum NativeResourceNameError {
+    Malformed,
+    Overflow,
 }
 
 #[derive(Debug, Clone)]
@@ -105,14 +116,44 @@ impl TypeName {
     }
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
-        let classification = TypeClassification::from_byte(bytes[0]);
-        let name = core::str::from_utf8(&bytes[1..]).unwrap().to_string();
-
+        let (classification, name) =
+            Self::borrowed_encoded_parts(bytes).expect("Malformed native type name");
         Self {
             classification,
-            name,
+            name: name.to_string(),
             legacy_classification: None,
         }
+    }
+
+    // Shared by the normal owned decoder and allocation-free native resource
+    // preflight. Classification and UTF-8 acceptance remain identical.
+    fn borrowed_encoded_parts(bytes: &[u8]) -> Option<(TypeClassification, &str)> {
+        let (&classification, name) = bytes.split_first()?;
+        Some((
+            TypeClassification::try_from_byte(classification)?,
+            core::str::from_utf8(name).ok()?,
+        ))
+    }
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn decoded_native_name_len(bytes: &[u8]) -> Option<usize> {
+        Self::borrowed_encoded_parts(bytes).map(|(_, name)| name.len())
+    }
+    pub(crate) fn valid_native_encoding(bytes: &[u8]) -> bool {
+        Self::borrowed_encoded_parts(bytes).is_some()
+    }
+    pub(crate) fn native_resource_matches<T: NativeResourceTypeName>(
+        bytes: &[u8],
+    ) -> Result<bool, NativeResourceNameError> {
+        let (classification, name) =
+            Self::borrowed_encoded_parts(bytes).ok_or(NativeResourceNameError::Malformed)?;
+        Ok(classification == TypeClassification::Internal && name == T::INTERNAL_RESOURCE_NAME)
+    }
+    pub(crate) fn native_resource_encoded_len<T: NativeResourceTypeName>()
+    -> Result<usize, NativeResourceNameError> {
+        T::INTERNAL_RESOURCE_NAME
+            .len()
+            .checked_add(1)
+            .ok_or(NativeResourceNameError::Overflow)
     }
 
     pub fn name(&self) -> &str {
@@ -262,6 +303,10 @@ pub trait Key: Value {
     }
 }
 
+impl NativeResourceTypeName for () {
+    const INTERNAL_RESOURCE_NAME: &'static str = "()";
+}
+
 impl Value for () {
     type SelfType<'a>
         = ()
@@ -293,7 +338,7 @@ impl Value for () {
     }
 
     fn type_name() -> TypeName {
-        TypeName::internal("()")
+        TypeName::internal(<Self as NativeResourceTypeName>::INTERNAL_RESOURCE_NAME)
     }
 }
 
@@ -474,7 +519,7 @@ impl<T: Key> Key for Option<T> {
             // Both are `Some`, encoded exactly as `T`, so they separate as `T` does. The result
             // is an encoding of `T`, which the niche never is.
             let separator = T::separator(left, right);
-            debug_assert!(separator.as_ref() != niche);
+            debug_assert_ne!(separator.as_ref(), niche);
             return separator;
         }
         // `None` sorts below every `Some` and encodes as the tag alone, so nothing is shorter
@@ -507,6 +552,10 @@ impl<T: Key> Key for Option<T> {
     }
 }
 
+impl NativeResourceTypeName for &[u8] {
+    const INTERNAL_RESOURCE_NAME: &'static str = "&[u8]";
+}
+
 impl Value for &[u8] {
     type SelfType<'a>
         = &'a [u8]
@@ -536,7 +585,7 @@ impl Value for &[u8] {
     }
 
     fn type_name() -> TypeName {
-        TypeName::internal("&[u8]")
+        TypeName::internal(<Self as NativeResourceTypeName>::INTERNAL_RESOURCE_NAME)
     }
 }
 
@@ -779,6 +828,10 @@ fn array_end_offset(data: &[u8], index: usize) -> usize {
 #[cfg(feature = "experimental-niches")]
 const STR_NICHE: &[u8] = &[0xff];
 
+impl NativeResourceTypeName for &str {
+    const INTERNAL_RESOURCE_NAME: &'static str = "&str";
+}
+
 impl Value for &str {
     type SelfType<'a>
         = &'a str
@@ -811,7 +864,7 @@ impl Value for &str {
     }
 
     fn type_name() -> TypeName {
-        TypeName::internal("&str")
+        TypeName::internal(<Self as NativeResourceTypeName>::INTERNAL_RESOURCE_NAME)
     }
 }
 

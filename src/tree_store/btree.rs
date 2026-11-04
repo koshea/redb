@@ -1,4 +1,36 @@
+#[cfg(not(redb_no_std))]
+#[path = "owned_checksum_source.rs"]
+mod owned_checksum_source;
+use crate::tree_store::NativeOwnedShared;
+use crate::tree_store::{NativeLocalPageVec, NativeOwnedPageVec};
+#[cfg(not(redb_no_std))]
+pub(crate) use owned_checksum_source::NativeChecksumPool;
+#[path = "resource_point_frontier.rs"]
+mod resource_point_frontier;
+#[path = "resource_point_recipe.rs"]
+mod resource_point_recipe;
 use crate::db::TransactionGuard;
+#[cfg(not(redb_no_std))]
+pub(crate) use resource_point_frontier::NativeFixedPointCells;
+#[path = "resource_system_namespace.rs"]
+pub(super) mod resource_system_namespace;
+pub(crate) use resource_point_frontier::{
+    NativeOwnedPointFrontierFacts, NativeOwnedPointFrontierPreparation, NativePointFrontierFacts,
+    NativePointFrontierPreparation, point_frontier_capture_bytes,
+};
+pub(crate) use resource_point_recipe::{
+    NativePointKey, NativePointMutation, NativePointRecipe, NativePointRecipeClass,
+};
+pub(crate) use resource_system_namespace::{
+    NativeSystemNamespaceFacts, NativeSystemNamespaceProfile,
+};
+#[path = "resource_allocator_purge.rs"]
+pub(super) mod resource_allocator_purge;
+pub(crate) use resource_allocator_purge::{NativeAllocatorPurgeFacts, NativeAllocatorPurgeWork};
+#[path = "resource_freed_paths.rs"]
+pub(super) mod resource_freed_paths;
+#[path = "resource_key_paths.rs"]
+pub(super) mod resource_key_paths;
 use crate::sync::Mutex;
 use crate::tree_store::btree_base::{
     AccessGuardMut, BRANCH, BranchAccessor, BranchMutator, BtreeHeader, Checksum, DEFERRED, LEAF,
@@ -25,6 +57,11 @@ use core::ops::Bound;
 use core::ops::RangeBounds;
 #[cfg(feature = "logging")]
 use log::trace;
+pub(crate) use resource_freed_paths::NativeFreedEntryRead;
+pub(crate) use resource_key_paths::{
+    CompiledPathVisits, NativeEpochKeyBatch, NativeEpochKeyPath, NativeKeyPathError,
+    NativePreparedNormalKey,
+};
 
 pub(crate) struct BtreeStats {
     pub(crate) tree_height: u32,
@@ -148,7 +185,7 @@ impl UntypedBtree {
 pub(super) struct UntypedBtreeMut {
     page_allocator: PageAllocator,
     root: Option<BtreeHeader>,
-    freed_pages: Arc<Mutex<Vec<PageNumber>>>,
+    freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
     key_width: Option<usize>,
     value_width: Option<usize>,
 }
@@ -157,7 +194,7 @@ impl UntypedBtreeMut {
     pub(super) fn new(
         root: Option<BtreeHeader>,
         page_allocator: PageAllocator,
-        freed_pages: Arc<Mutex<Vec<PageNumber>>>,
+        freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
         key_width: Option<usize>,
         value_width: Option<usize>,
     ) -> Self {
@@ -188,36 +225,44 @@ impl UntypedBtreeMut {
                 return Ok(root);
             }
 
-            *checksum = self.finalize_dirty_checksums_helper(*p)?;
+            *checksum = self.finalize_dirty_checksums_helper(*p, 0)?;
             self.root = root;
         }
 
         Ok(root)
     }
 
-    fn finalize_dirty_checksums_helper(&mut self, page_number: PageNumber) -> Result<Checksum> {
+    fn finalize_dirty_checksums_helper(
+        &mut self,
+        page_number: PageNumber,
+        depth: usize,
+    ) -> Result<Checksum> {
         assert!(self.page_allocator.uncommitted(page_number));
+        // Checkout precedes mutable-page admission and recursion. Parent
+        // frames retain their actual child vectors until their children finish.
+        let mut new_children = self.page_allocator.prepare_checksum_frame(depth)?;
         let mut page = self.page_allocator.get_page_mut(page_number)?;
 
         match page.memory()[0] {
             LEAF => leaf_checksum(&page, self.key_width, self.value_width),
             BRANCH => {
                 let accessor = BranchAccessor::new(&page, self.key_width);
-                let mut new_children = vec![];
                 for i in 0..accessor.count_children() {
                     let child_page = accessor.child_page(i).unwrap();
                     if self.page_allocator.uncommitted(child_page) {
-                        let new_checksum = self.finalize_dirty_checksums_helper(child_page)?;
-                        new_children.push(Some((i, child_page, new_checksum)));
+                        let new_checksum = self.finalize_dirty_checksums_helper(
+                            child_page,
+                            depth.checked_add(1).ok_or(StorageError::PreviousIo)?,
+                        )?;
+                        new_children.try_push(Some((i, child_page, new_checksum)))?;
                     } else {
                         // Child is clean, skip it
-                        new_children.push(None);
+                        new_children.try_push(None)?;
                     }
                 }
 
                 let mut mutator = BranchMutator::new(page.memory_mut());
-                for (child_index, child_page, child_checksum) in new_children.into_iter().flatten()
-                {
+                for (child_index, child_page, child_checksum) in new_children.drain(..).flatten() {
                     mutator.write_child_page(child_index, child_page, child_checksum);
                 }
 
@@ -348,22 +393,22 @@ impl UntypedBtreeMut {
 // a whole tree descent: tables of one WriteTransaction share it and may be written from different
 // threads. Callers must merge before propagating errors, since pages queued before a failure still
 // need to be recorded for commit.
-fn merge_freed_pages(freed_pages: &Mutex<Vec<PageNumber>>, freed: &mut Vec<PageNumber>) {
+fn merge_freed_pages(freed_pages: &Mutex<NativeOwnedPageVec>, freed: &mut NativeOwnedPageVec) {
     if !freed.is_empty() {
-        freed_pages.lock().unwrap().append(freed);
+        freed_pages.lock().unwrap().append_owner(freed);
     }
 }
 
 pub(crate) struct BtreeMut<K: Key + 'static, V: Value + 'static> {
     page_allocator: PageAllocator,
-    transaction_guard: Arc<TransactionGuard>,
+    transaction_guard: NativeOwnedShared<TransactionGuard>,
     root: Option<BtreeHeader>,
-    freed_pages: Arc<Mutex<Vec<PageNumber>>>,
+    freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
     // Scratch list for the pages freed by a single operation, merged into `freed_pages` before
     // that operation returns. Kept here, instead of allocated per operation, so that its capacity
     // is reused across operations that free committed pages.
-    local_freed: Vec<PageNumber>,
-    allocated_pages: Arc<PageTracker>,
+    local_freed: NativeLocalPageVec,
+    allocated_pages: NativeOwnedShared<PageTracker>,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
 }
@@ -371,21 +416,73 @@ pub(crate) struct BtreeMut<K: Key + 'static, V: Value + 'static> {
 impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
     pub(crate) fn new(
         root: Option<BtreeHeader>,
-        guard: Arc<TransactionGuard>,
+        guard: NativeOwnedShared<TransactionGuard>,
         page_allocator: PageAllocator,
-        freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-        allocated_pages: Arc<PageTracker>,
+        freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+        allocated_pages: NativeOwnedShared<PageTracker>,
     ) -> Self {
         Self {
             page_allocator,
             transaction_guard: guard,
             root,
             freed_pages,
-            local_freed: vec![],
+            local_freed: NativeLocalPageVec::default(),
             allocated_pages,
             _key_type: PhantomData,
             _value_type: PhantomData,
         }
+    }
+
+    fn prepare_local_freed(&mut self) -> Result<()> {
+        let original = self.freed_pages.lock()?;
+        self.page_allocator
+            .prepare_local_freed(&original, &mut self.local_freed)
+    }
+
+    // Deliberately malformed native fixture: preserve actual pages, native COW,
+    // and checksum finalization, but alias two distinct root child slots. This
+    // does not construct a valid database or provide resource/write authority.
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn alias_first_root_child_for_point_frontier_test(
+        &mut self,
+    ) -> Result<Option<Vec<u8>>> {
+        self.prepare_local_freed()?;
+        let Some(header) = self.root else {
+            return Ok(None);
+        };
+        let old = self.page_allocator.get_page(header.root, PageHint::None)?;
+        if old.memory()[0] != BRANCH {
+            return Ok(None);
+        }
+        let branch = BranchAccessor::new(&old, K::fixed_width());
+        if branch.count_children() < 2 {
+            return Ok(None);
+        }
+        let first = branch.child_page(0).unwrap();
+        let checksum = branch.child_checksum(0).unwrap();
+        // Byte-key fixture: lexicographically immediately above the first
+        // separator selects the actual second edge, without inventing a root.
+        let mut second_edge_key = branch.key(0).unwrap().to_vec();
+        second_edge_key.push(0);
+        if branch.child_for_key::<K>(&second_edge_key).0 != 1 {
+            return Ok(None);
+        }
+        let mut replacement = self
+            .page_allocator
+            .allocate(old.memory().len(), &self.allocated_pages)?;
+        replacement.memory_mut().copy_from_slice(old.memory());
+        BranchMutator::new(replacement.memory_mut()).write_child_page(1, first, checksum);
+        let root = replacement.get_page_number();
+        drop(replacement);
+        drop(old);
+        self.page_allocator.conditional_free(
+            header.root,
+            &self.allocated_pages,
+            &mut self.local_freed,
+        );
+        merge_freed_pages(&self.freed_pages, &mut self.local_freed);
+        self.root = Some(BtreeHeader::new(root, DEFERRED, header.length));
+        Ok(Some(second_edge_key))
     }
 
     pub(crate) fn finalize_dirty_checksums(&mut self) -> Result<Option<BtreeHeader>> {
@@ -451,6 +548,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
         key: &K::SelfType<'_>,
         value: &V::SelfType<'_>,
     ) -> Result<Option<AccessGuard<'_, V>>> {
+        self.prepare_local_freed()?;
         #[cfg(feature = "logging")]
         trace!(
             "Btree(root={:?}): Inserting {:?} with value of length {}",
@@ -479,13 +577,12 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
         key: &K::SelfType<'_>,
         value: &V::SelfType<'_>,
     ) -> Result<()> {
-        let mut fake_freed_pages = vec![];
-        let fake_allocated_pages = Arc::new(PageTracker::closed());
+        let mut fake_freed_pages = NativeOwnedPageVec::default();
         let mut operation = MutateHelper::<K, V>::new(
             &mut self.root,
             &self.page_allocator,
-            fake_freed_pages.as_mut(),
-            &fake_allocated_pages,
+            &mut fake_freed_pages,
+            &self.allocated_pages,
         );
         operation.insert_inplace(key, value)?;
         assert!(fake_freed_pages.is_empty());
@@ -513,6 +610,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
     }
 
     pub(crate) fn remove(&mut self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'_, V>>> {
+        self.prepare_local_freed()?;
         #[cfg(feature = "logging")]
         trace!("Btree(root={:?}): Deleting {:?}", &self.root, key);
         let mut operation: MutateHelper<'_, '_, K, V> = MutateHelper::new(
@@ -528,6 +626,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
 
     // Removes and returns the leftmost entry in the tree, if any, in a single tree descent.
     pub(crate) fn pop_first(&mut self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>> {
+        self.prepare_local_freed()?;
         let mut cursor: CursorMut<'_, '_, K, V> = CursorMut::new(
             &mut self.root,
             &self.page_allocator,
@@ -543,6 +642,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
 
     // Removes and returns the rightmost entry in the tree, if any, in a single tree descent.
     pub(crate) fn pop_last(&mut self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>> {
+        self.prepare_local_freed()?;
         let mut cursor: CursorMut<'_, '_, K, V> = CursorMut::new(
             &mut self.root,
             &self.page_allocator,
@@ -625,6 +725,8 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
         mut page: PageMut<'txn>,
         query: &[u8],
     ) -> Result<Option<AccessGuardMut<'txn, V>>> {
+        resource_key_paths::check_btree_key::<K>(query)?;
+        resource_key_paths::check_btree_node::<K, V>(&page)?;
         let node_mem = page.memory();
         match node_mem[0] {
             LEAF => {
@@ -725,6 +827,45 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
     where
         K: 'a0,
     {
+        if self.page_allocator.is_checked_source() {
+            // Closed fixed execution only reaches this through the actual
+            // built-in FREED table. Type identity is allocation-free and does
+            // not call heap-allocating public type_name() implementations.
+            if core::any::TypeId::of::<K>()
+                != core::any::TypeId::of::<crate::transactions::TransactionIdWithPagination>()
+                || core::any::TypeId::of::<V>()
+                    != core::any::TypeId::of::<crate::transactions::PageList<'static>>()
+            {
+                return Err(StorageError::PreviousIo);
+            }
+            let (Bound::Included(lower), Bound::Included(upper)) =
+                (range.start_bound(), range.end_bound())
+            else {
+                return Err(StorageError::PreviousIo);
+            };
+            let lower = K::as_bytes(lower.borrow());
+            let upper = K::as_bytes(upper.borrow());
+            if lower.as_ref() != upper.as_ref() || lower.as_ref().len() != 16 {
+                return Err(StorageError::PreviousIo);
+            }
+            // Both named buffers were constructed before writer claim; no
+            // bound copy allocates. Any missing slot refuses before descent.
+            let lower = self
+                .page_allocator
+                .copy_cursor_key(super::btree_cursor::FixedCursorKey::Lower, lower.as_ref())?;
+            let upper = self
+                .page_allocator
+                .copy_cursor_key(super::btree_cursor::FixedCursorKey::Upper, upper.as_ref())?;
+            return Ok(BtreeExtractIf::new_prepared_bounds(
+                &mut self.root,
+                Bound::Included(lower),
+                Bound::Included(upper),
+                predicate,
+                self.freed_pages.clone(),
+                self.allocated_pages.clone(),
+                self.page_allocator.clone(),
+            ));
+        }
         let (lower_bound, upper_bound) = encode_bounds::<K, KR, T>(range);
         self.extract_from_bounds(lower_bound, upper_bound, predicate)
     }
@@ -785,7 +926,12 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
 
         // Uses its own list rather than `local_freed`: retain_in_helper takes `&mut self`, so it
         // cannot also borrow the field. One allocation is amortized over the whole scan.
-        let mut freed = vec![];
+        let mut freed = NativeLocalPageVec::default();
+        {
+            let original = self.freed_pages.lock()?;
+            self.page_allocator
+                .prepare_local_freed(&original, &mut freed)?;
+        }
         let result = self.retain_in_helper(
             lower_bound.as_ref().map(Vec::as_slice),
             upper_bound.as_ref().map(Vec::as_slice),
@@ -804,7 +950,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
         lower_bound: Bound<&[u8]>,
         upper_bound: Bound<&[u8]>,
         predicate: &mut F,
-        freed: &mut Vec<PageNumber>,
+        freed: &mut NativeOwnedPageVec,
         poisoned: &mut bool,
     ) -> Result
     where
@@ -876,6 +1022,7 @@ impl<K: Key + 'static, V: MutInPlaceValue + 'static> BtreeMut<K, V> {
         key: &K::SelfType<'_>,
         value_length: usize,
     ) -> Result<AccessGuardMutInPlace<'_, V>> {
+        self.prepare_local_freed()?;
         #[cfg(feature = "logging")]
         trace!(
             "Btree(root={:?}): Inserting {:?} with {} reserved bytes for the value",
@@ -1001,7 +1148,7 @@ impl RawBtree {
 
 pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
     mem: PageResolver,
-    transaction_guard: Arc<TransactionGuard>,
+    transaction_guard: NativeOwnedShared<TransactionGuard>,
     // Cache of the root page to avoid repeated lookups
     cached_root: Option<PageImpl>,
     root: Option<BtreeHeader>,
@@ -1014,7 +1161,7 @@ impl<K: Key, V: Value> Btree<K, V> {
     pub(crate) fn new(
         root: Option<BtreeHeader>,
         hint: PageHint,
-        guard: Arc<TransactionGuard>,
+        guard: NativeOwnedShared<TransactionGuard>,
         mem: PageResolver,
     ) -> Result<Self> {
         let cached_root = if let Some(header) = root {
@@ -1033,7 +1180,7 @@ impl<K: Key, V: Value> Btree<K, V> {
         })
     }
 
-    pub(crate) fn transaction_guard(&self) -> &Arc<TransactionGuard> {
+    pub(crate) fn transaction_guard(&self) -> &NativeOwnedShared<TransactionGuard> {
         &self.transaction_guard
     }
 
@@ -1047,6 +1194,10 @@ impl<K: Key, V: Value> Btree<K, V> {
         BtreeCursor::new(self.root, self.mem.clone(), self.hint)
     }
 
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn context_current_for_test(&self) -> usize {
+        self.mem.context_current_for_test()
+    }
     pub(crate) fn get_root(&self) -> Option<BtreeHeader> {
         self.root
     }
@@ -1086,9 +1237,11 @@ impl<K: Key, V: Value> Btree<K, V> {
 
     // Returns the value for the queried key, if present
     fn get_helper(&self, page: &PageImpl, query: &[u8]) -> Result<Option<AccessGuard<'static, V>>> {
+        resource_key_paths::check_btree_key::<K>(query)?;
         let mut descended: Option<PageImpl> = None;
         for _ in 0..MAX_BTREE_DEPTH {
             let page = descended.as_ref().unwrap_or(page);
+            resource_key_paths::check_btree_node::<K, V>(page)?;
             let child_page = match page.memory()[0] {
                 LEAF => {
                     let accessor =
@@ -1134,6 +1287,7 @@ impl<K: Key, V: Value> Btree<K, V> {
                 "Btree exceeded maximum depth".to_string(),
             ));
         }
+        resource_key_paths::check_btree_node::<K, V>(&page)?;
         let node_mem = page.memory();
         match node_mem[0] {
             LEAF => {
@@ -1173,6 +1327,7 @@ impl<K: Key, V: Value> Btree<K, V> {
                 "Btree exceeded maximum depth".to_string(),
             ));
         }
+        resource_key_paths::check_btree_node::<K, V>(&page)?;
         let node_mem = page.memory();
         match node_mem[0] {
             LEAF => {
@@ -1505,5 +1660,78 @@ mod tests {
             err_str.contains("Cycle detected in Btree pages"),
             "Expected cycle error, got: {err_str}"
         );
+    }
+}
+
+#[cfg(not(redb_no_std))]
+pub(crate) use resource_point_frontier::{
+    NativeFreedPointFrontierShape, freed_point_selection_capacity_bytes,
+};
+
+#[cfg(not(redb_no_std))]
+pub(crate) use resource_point_frontier::NativeFreedAppendGapShape;
+
+#[cfg(not(redb_no_std))]
+pub(crate) use resource_point_frontier::{NativeFreedPhaseForest, NativeFreedPhaseGeometry};
+
+#[cfg(all(test, not(redb_no_std)))]
+impl BtreeMut<u128, &[u8]> {
+    pub(crate) fn fixed_phase_user_leaf_shapes_for_fixture(
+        &self,
+    ) -> Result<Option<[(usize, usize, [(u128, usize); 8]); 8]>> {
+        fn leaf_shape(page: &PageImpl) -> Option<(usize, usize, [(u128, usize); 8])> {
+            if page.memory().first().copied() != Some(LEAF) {
+                return None;
+            }
+            let leaf = LeafAccessor::new(page.memory(), <u128 as Value>::fixed_width(), None);
+            if leaf.num_pairs() == 0 || leaf.num_pairs() > 8 {
+                return None;
+            }
+            let mut entries = [(0_u128, 0_usize); 8];
+            for (index, slot) in entries.iter_mut().enumerate().take(leaf.num_pairs()) {
+                let entry = leaf.entry(index)?;
+                if entry.key().len() != 16 {
+                    return None;
+                }
+                *slot = (
+                    <u128 as Value>::from_bytes(entry.key()),
+                    entry.value().len(),
+                );
+            }
+            Some((page.memory().len(), leaf.num_pairs(), entries))
+        }
+        let Some(root) = self.root else {
+            return Ok(None);
+        };
+        let page = self.page_allocator.get_page(root.root, PageHint::None)?;
+        let mut shapes = [(0_usize, 0_usize, [(0_u128, 0_usize); 8]); 8];
+        if page.memory().first().copied() == Some(LEAF) {
+            let Some(shape) = leaf_shape(&page) else {
+                return Ok(None);
+            };
+            shapes[0] = shape;
+            return Ok(Some(shapes));
+        }
+        if page.memory().first().copied() != Some(BRANCH) {
+            return Ok(None);
+        }
+        let branch = BranchAccessor::new(&page, <u128 as Value>::fixed_width());
+        if branch.count_children() == 0 || branch.count_children() > 8 {
+            return Ok(None);
+        }
+        // This tiny fixture is exactly one branch level. A deeper topology
+        // refuses diagnostically; no recursion, Vec or raw-page return exists.
+        for (index, slot) in shapes.iter_mut().enumerate().take(branch.count_children()) {
+            let Some(child) = branch.child_page(index) else {
+                return Ok(None);
+            };
+            let leaf = self.page_allocator.get_page(child, PageHint::None)?;
+            let Some(shape) = leaf_shape(&leaf) else {
+                return Ok(None);
+            };
+            *slot = shape;
+            drop(leaf); // Owning PageImpl dropped before the next fetch; cache custody may remain.
+        }
+        Ok(Some(shapes))
     }
 }

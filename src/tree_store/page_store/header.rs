@@ -55,7 +55,7 @@ const _UNUSED3_OFFSET: usize = TRAILING_REGION_DATA_PAGES_OFFSET + size_of::<u32
 const TRANSACTION_SIZE: usize = 128;
 const TRANSACTION_0_OFFSET: usize = 64;
 const TRANSACTION_1_OFFSET: usize = TRANSACTION_0_OFFSET + TRANSACTION_SIZE;
-pub(super) const DB_HEADER_SIZE: usize = TRANSACTION_1_OFFSET + TRANSACTION_SIZE;
+pub(crate) const DB_HEADER_SIZE: usize = TRANSACTION_1_OFFSET + TRANSACTION_SIZE;
 
 // God byte flags
 const PRIMARY_BIT: u8 = 1;
@@ -1244,6 +1244,101 @@ mod test {
             matches!(err, DatabaseError::Storage(StorageError::Corrupted(_))),
             "expected Corrupted, got {err:?}"
         );
+    }
+
+    #[cfg(not(redb_no_std))]
+    #[test]
+    // req: STO-020, REC-001, REC-003, REC-005, PRJ-004
+    fn maintenance_open_rejects_checksummed_invalid_utf8_system_key() {
+        use crate::transactions::ALLOCATOR_STATE_TABLE_NAME;
+        use crate::tree_store::btree_base::{LEAF, LeafAccessor};
+
+        let tmpfile = crate::create_tempfile();
+        create_database_with_one_table(tmpfile.path());
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmpfile.path())
+            .unwrap();
+        let file_len = file.metadata().unwrap().len();
+        assert!(file_len <= 16 * 1024 * 1024);
+        let mut header = [0u8; DB_HEADER_SIZE];
+        file.read_exact(&mut header).unwrap();
+        let page_size = get_u32(&header[PAGE_SIZE_OFFSET..]);
+        let (parsed, clean) = super::UnrepairedDatabaseHeader::from_bytes(&header, page_size)
+            .unwrap()
+            .finalize(file_len)
+            .unwrap();
+        assert!(clean);
+        assert!(parsed.two_phase_commit);
+        assert!(!parsed.recovery_required);
+        let mut root = parsed.primary_slot().system_root.unwrap();
+        let layout = parsed.layout();
+        let region = layout.full_region_layout();
+        let address = root.root.address_range(
+            u64::from(page_size),
+            region.len(),
+            region.data_section().start,
+            page_size,
+        );
+        assert!(address.end <= file_len);
+        let mut page = vec![0u8; usize::try_from(address.end - address.start).unwrap()];
+        file.seek(SeekFrom::Start(address.start)).unwrap();
+        file.read_exact(&mut page).unwrap();
+        assert_eq!(page[0], LEAF);
+        let accessor = LeafAccessor::new(&page, None, None);
+        assert!(accessor.num_pairs() > 0);
+        let key = (0..accessor.num_pairs())
+            .map(|index| accessor.entry_ranges(index).unwrap().0)
+            .find(|range| &page[range.clone()] == ALLOCATOR_STATE_TABLE_NAME.as_bytes())
+            .expect("ordinary close must persist the allocator-state definition");
+        let payload_end = accessor.total_length();
+        // This is the same payload framing and checksum kernel used by leaf_checksum.
+        assert_eq!(root.checksum, super::xxh3_checksum(&page[..payload_end]));
+        page[key.start] = 0xff;
+        assert!(core::str::from_utf8(&page[key]).is_err());
+        root.checksum = super::xxh3_checksum(&page[..payload_end]);
+        let slot = primary_slot_offset(header[GOD_BYTE_OFFSET]);
+        let root_offset = slot + super::SYSTEM_ROOT_OFFSET;
+        header[root_offset..root_offset + super::BtreeHeader::serialized_size()]
+            .copy_from_slice(&root.to_le_bytes());
+        let slot_checksum = super::xxh3_checksum(&header[slot..slot + super::SLOT_CHECKSUM_OFFSET]);
+        let checksum_offset = slot + super::SLOT_CHECKSUM_OFFSET;
+        header[checksum_offset..checksum_offset + size_of::<super::Checksum>()]
+            .copy_from_slice(&slot_checksum.to_le_bytes());
+        let (_, clean) = super::UnrepairedDatabaseHeader::from_bytes(&header, page_size)
+            .unwrap()
+            .finalize(file_len)
+            .unwrap();
+        assert!(
+            clean,
+            "the malformed key must retain a valid commit-slot checksum"
+        );
+        file.seek(SeekFrom::Start(address.start)).unwrap();
+        file.write_all(&page).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&header).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let corrupted = std::fs::read(tmpfile.path()).unwrap();
+
+        // The maintenance open searches this real system key while loading allocator state.
+        // An untrusted key must produce a typed refusal rather than unwind from UTF-8 decoding.
+        let Err(err) = crate::Builder::new()
+            .open_read_only_maintenance_file(std::fs::File::open(tmpfile.path()).unwrap())
+        else {
+            panic!("expected malformed persisted key to be rejected");
+        };
+        assert!(
+            matches!(
+                err,
+                crate::ReadOnlyReopenError::Native(DatabaseError::Storage(
+                    StorageError::Corrupted(_)
+                ))
+            ),
+            "expected native Corrupted, got {err:?}"
+        );
+        assert_eq!(std::fs::read(tmpfile.path()).unwrap(), corrupted);
     }
 
     // A backend that can report a `len()` larger than the data it actually holds, without

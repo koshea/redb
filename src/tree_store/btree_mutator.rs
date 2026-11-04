@@ -1,3 +1,11 @@
+#[cfg(not(redb_no_std))]
+#[path = "owned_packing_source.rs"]
+mod owned_packing_source;
+use super::fixed_scratch::ScratchVec;
+use super::owned_branch_keys::{OwnedSeparator, PartialBranchKeys};
+use crate::tree_store::NativeOwnedPageVec;
+use crate::tree_store::NativeOwnedShared;
+use crate::tree_store::SharedPageBytes;
 use crate::tree_store::btree_base::{
     BRANCH, BranchAccessor, BranchBuilder, BranchMutator, Checksum, DEFERRED, LEAF, LeafAccessor,
     LeafBuilder, LeafMutator, OwnedEntryBuffer, RawBranchBuilder, branch_separator,
@@ -20,6 +28,10 @@ use alloc::vec::Vec;
 use core::cmp::{max, min};
 use core::marker::PhantomData;
 use core::ops::Range;
+#[cfg(not(redb_no_std))]
+pub(super) use owned_packing_source::FixedPackedLeaf;
+#[cfg(not(redb_no_std))]
+pub(crate) use owned_packing_source::NativeFixedPackingPool;
 
 #[derive(Debug)]
 enum DeletionResult {
@@ -30,7 +42,7 @@ enum DeletionResult {
     DeletedSubtree,
     // A leaf with fewer entries than desired
     PartialLeaf {
-        page: Arc<[u8]>,
+        page: SharedPageBytes,
         deleted_pairs: DeletedPairs,
     },
     // A branch page subtree with fewer children than desired.
@@ -39,8 +51,8 @@ enum DeletionResult {
     // Checksums are retained because preserved children may be clean pages whose real
     // checksums must be propagated (finalize only recomputes uncommitted pages).
     PartialBranch {
-        children: Vec<(PageNumber, Checksum)>,
-        keys: Vec<Vec<u8>>,
+        children: ScratchVec<(PageNumber, Checksum)>,
+        keys: PartialBranchKeys,
     },
     // Indicates that the branch node was deleted, and includes the only remaining child.
     // Checksum is retained for the same reason as `PartialBranch`.
@@ -51,6 +63,23 @@ enum DeletionResult {
 enum DeletedPairs {
     One(usize),
     Many(Vec<usize>),
+}
+
+#[cfg(all(test, not(redb_no_std)))]
+impl DeletionResult {
+    fn trace_partial(
+        &self,
+        allocator: &PageAllocator,
+    ) -> Option<crate::tree_store::page_store::NativePointTraceScope> {
+        let PartialBranch { children, keys } = self else {
+            return None;
+        };
+        allocator.point_trace().map(|t| {
+            let bytes = children.capacity() * core::mem::size_of::<(PageNumber, Checksum)>()
+                + keys.heap_capacity_bytes();
+            t.scope(2, bytes, 0, 0)
+        })
+    }
 }
 
 impl DeletedPairs {
@@ -66,6 +95,31 @@ impl DeletedPairs {
 // its subtree: a separator no less than the subtree's greatest key. The bound
 // is None when the parent's stored separator still covers the subtree, which
 // includes the node holding the tree's original last entry.
+enum ReplacementLeaves {
+    Ordinary(Vec<(PageNumber, Vec<u8>)>),
+    #[cfg(not(redb_no_std))]
+    Source(ScratchVec<FixedPackedLeaf>),
+}
+impl ReplacementLeaves {
+    fn len(&self) -> usize {
+        match self {
+            Self::Ordinary(v) => v.len(),
+            #[cfg(not(redb_no_std))]
+            Self::Source(v) => v.len(),
+        }
+    }
+    fn get(&self, index: usize) -> Option<(PageNumber, &[u8])> {
+        match self {
+            Self::Ordinary(v) => v.get(index).map(|(page, key)| (*page, key.as_slice())),
+            #[cfg(not(redb_no_std))]
+            Self::Source(v) => v.get(index).map(|leaf| (leaf.page, leaf.upper.as_slice())),
+        }
+    }
+    fn iter(&self) -> impl Iterator<Item = (PageNumber, &[u8])> {
+        (0..self.len()).map(|index| self.get(index).expect("existing replacement leaf"))
+    }
+}
+
 type SplicedNode = (PageNumber, Checksum, Option<Vec<u8>>);
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -86,7 +140,7 @@ struct InsertionResult<'a, V: Value + 'static> {
     // checksum of the root page
     root_checksum: Checksum,
     // Following sibling, if the root had to be split
-    additional_sibling: Option<(Vec<u8>, PageNumber, Checksum)>,
+    additional_sibling: Option<(OwnedSeparator, PageNumber, Checksum)>,
     // The inserted value for .insert_reserve() to use
     inserted_value: AccessGuardMutInPlace<'a, V>,
     // The previous value, if any
@@ -96,8 +150,8 @@ struct InsertionResult<'a, V: Value + 'static> {
 pub(crate) struct MutateHelper<'a, 'b, K: Key, V: Value> {
     root: &'b mut Option<BtreeHeader>,
     page_allocator: &'b PageAllocator,
-    freed: &'b mut Vec<PageNumber>,
-    allocated: &'b Arc<PageTracker>,
+    freed: &'b mut NativeOwnedPageVec,
+    allocated: &'b NativeOwnedShared<PageTracker>,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
     _lifetime: ScopedBorrow<'a>,
@@ -107,8 +161,8 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     pub(crate) fn new(
         root: &'b mut Option<BtreeHeader>,
         page_allocator: &'b PageAllocator,
-        freed: &'b mut Vec<PageNumber>,
-        allocated: &'b Arc<PageTracker>,
+        freed: &'b mut NativeOwnedPageVec,
+        allocated: &'b NativeOwnedShared<PageTracker>,
     ) -> Self {
         Self {
             root,
@@ -127,6 +181,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     }
 
     pub(crate) fn delete(&mut self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'a, V>>> {
+        self.page_allocator.require_closed_branch_key::<K>()?;
         self.delete_key(K::as_bytes(key).as_ref(), true)
     }
 
@@ -137,6 +192,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         key: &[u8],
         allow_in_place: bool,
     ) -> Result<Option<AccessGuard<'a, V>>> {
+        self.page_allocator.require_closed_branch_key::<K>()?;
         if let Some(BtreeHeader {
             root: p, length, ..
         }) = *self.root
@@ -159,6 +215,8 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     }
 
     fn finish_deletion(&mut self, deletion_result: DeletionResult, new_length: u64) -> Result {
+        #[cfg(all(test, not(redb_no_std)))]
+        let _partial_trace = deletion_result.trace_partial(self.page_allocator);
         let new_root = match deletion_result {
             Subtree(page) => Some(BtreeHeader::new(page, DEFERRED, new_length)),
             DeletedSubtree => None,
@@ -192,12 +250,13 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     self.allocated,
                     children.len(),
                     K::fixed_width(),
-                );
-                for (child, child_checksum) in children {
-                    builder.push_child(child, child_checksum);
+                )?;
+                for &(child, child_checksum) in children.iter() {
+                    builder.push_child(child, child_checksum)?;
                 }
-                for key in &keys {
-                    builder.push_key(key);
+                drop(children);
+                for key in keys.iter() {
+                    builder.push_key(key)?;
                 }
                 let page = builder.build()?;
                 Some(BtreeHeader::new(
@@ -218,12 +277,13 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     pub(super) fn pop_leaf_entry(
         &mut self,
         leaf: PageImpl,
-        path: Vec<(PageImpl, usize)>,
+        mut path: ScratchVec<(PageImpl, usize)>,
         position: usize,
     ) -> Result<(AccessGuard<'a, K>, AccessGuard<'a, V>)> {
+        self.page_allocator.require_closed_branch_key::<K>()?;
         let length = self.root.expect("pop requires a root").length;
         let (mut result, key, value) = self.delete_leaf_at_position(leaf, position, true, true)?;
-        for (page, child_index) in path.into_iter().rev() {
+        for (page, child_index) in path.drain(..).rev() {
             result = self.apply_child_deletion_result(page, child_index, result)?;
         }
         self.finish_deletion(result, length - 1)?;
@@ -238,7 +298,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     pub(super) fn delete_leaf_entries(
         &mut self,
         leaf: PageImpl,
-        path: Vec<(PageImpl, usize)>,
+        mut path: ScratchVec<(PageImpl, usize)>,
         indexes: &[usize],
         allow_in_place: bool,
     ) -> Result {
@@ -247,7 +307,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         }
         let length = self.root.expect("delete requires a root").length;
         let mut result = self.delete_leaf_indexes(leaf, indexes, allow_in_place)?;
-        for (page, child_index) in path.into_iter().rev() {
+        for (page, child_index) in path.drain(..).rev() {
             result = self.apply_child_deletion_result(page, child_index, result)?;
         }
         self.finish_deletion(result, length - indexes.len() as u64)
@@ -259,18 +319,19 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     // original branch.
     pub(super) fn replace_leaf_children(
         &mut self,
-        mut path: Vec<(PageImpl, usize)>,
+        mut path: ScratchVec<(PageImpl, usize)>,
         mut replaced_children: Range<usize>,
         mut entries: OwnedEntryBuffer,
         removed_pairs: u64,
     ) -> Result {
+        self.page_allocator.require_closed_branch_key::<K>()?;
         assert!(!replaced_children.is_empty());
         let length = self.root.expect("replace requires a root").length;
         let (parent_page, _) = path
             .pop()
             .expect("leaf child replacement requires a parent branch");
         let parent_page_number = parent_page.get_page_number();
-        let (mut result, removed_leaf_pages) = {
+        let (mut result, mut removed_leaf_pages) = {
             let accessor = BranchAccessor::new(&parent_page, K::fixed_width());
             let old_children = accessor.count_children();
             assert!(replaced_children.end <= old_children);
@@ -302,7 +363,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                         LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
                     if !is_single_large_value(&neighbor, self.page_allocator.get_page_size()) {
                         let at_back = neighbor_index == replaced_children.end;
-                        entries.extend_from_leaf(&neighbor, &[], at_back);
+                        entries.extend_from_leaf(&neighbor, &[], at_back)?;
                         if at_back {
                             replaced_children.end += 1;
                         } else {
@@ -311,12 +372,21 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     }
                 }
             }
+            let removed_leaf_pages = if self.page_allocator.is_checked_source() {
+                let mut prepared = self.page_allocator.prepare_removed_leaf_pages()?;
+                for index in replaced_children.clone() {
+                    prepared.try_push(accessor.child_page(index).unwrap())?;
+                }
+                prepared
+            } else {
+                ScratchVec::ordinary(
+                    replaced_children
+                        .clone()
+                        .map(|index| accessor.child_page(index).unwrap())
+                        .collect(),
+                )
+            };
             let replacement_leaves = self.build_replacement_leaves(&entries)?;
-
-            let removed_leaf_pages = replaced_children
-                .clone()
-                .map(|i| accessor.child_page(i).unwrap())
-                .collect::<Vec<_>>();
             let new_children = old_children - replaced_children.len() + replacement_leaves.len();
             let result = if new_children == 0 {
                 DeletedSubtree
@@ -326,7 +396,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     self.allocated,
                     new_children,
                     K::fixed_width(),
-                );
+                )?;
                 // Preserved children reuse their original checksum and
                 // separator; freshly built replacements have a deferred
                 // checksum and the separators computed above.
@@ -342,19 +412,19 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     .chain(
                         replacement_leaves
                             .iter()
-                            .map(|(page, upper_key)| (*page, DEFERRED, Some(upper_key.as_slice()))),
+                            .map(|(page, upper_key)| (page, DEFERRED, Some(upper_key))),
                     )
                     .chain((replaced_children.end..old_children).map(&preserved));
                 let mut pushed = 0;
                 for (page, checksum, key) in children {
-                    builder.push_child(page, checksum);
+                    builder.push_child(page, checksum)?;
                     pushed += 1;
                     // Branches store one separator key after every child
                     // except the last. The only child whose key is None is the
                     // branch's original last child, which can only appear here
                     // as the final pushed child, so the unwrap never runs dry.
                     if pushed < new_children {
-                        builder.push_key(key.unwrap());
+                        builder.push_key(key.unwrap())?;
                     }
                 }
                 debug_assert_eq!(pushed, new_children);
@@ -364,7 +434,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         };
         drop(parent_page);
 
-        for (page, child_index) in path.into_iter().rev() {
+        for (page, child_index) in path.drain(..).rev() {
             result = self.apply_child_deletion_result(page, child_index, result)?;
         }
 
@@ -375,7 +445,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         // Freed only after every fallible step, so an error never leaves the
         // surviving root referencing a freed page.
         self.conditional_free(parent_page_number);
-        for page_number in removed_leaf_pages {
+        for page_number in removed_leaf_pages.drain(..) {
             self.conditional_free(page_number);
         }
         Ok(())
@@ -386,10 +456,11 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     // latched the storage layer's io_failed flag, which blocks every later
     // commit, so pages already built are transient in-memory state reclaimed
     // on rollback.
-    fn build_replacement_leaves(
-        &self,
-        buffer: &OwnedEntryBuffer,
-    ) -> Result<Vec<(PageNumber, Vec<u8>)>> {
+    fn build_replacement_leaves(&self, buffer: &OwnedEntryBuffer) -> Result<ReplacementLeaves> {
+        #[cfg(not(redb_no_std))]
+        if self.page_allocator.is_checked_source() {
+            return self.build_fixed_replacement_leaves(buffer);
+        }
         let fixed_key = K::fixed_width();
         let fixed_value = V::fixed_width();
         let page_size = self.page_allocator.get_page_size();
@@ -469,7 +540,121 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             leaves.push((page1.get_page_number(), split_key.into_owned()));
             leaves.push((page2.get_page_number(), entries[range.end - 1].0.to_vec()));
         }
-        Ok(leaves)
+        Ok(ReplacementLeaves::Ordinary(leaves))
+    }
+
+    // Same greedy/last-two balancing algorithm, using readonly indexed source
+    // entries and actual prepaid plan/output backing. Fixed native keys have
+    // 16B separators; branch_separator returns the original left key for them.
+    #[cfg(not(redb_no_std))]
+    fn build_fixed_replacement_leaves(
+        &self,
+        buffer: &OwnedEntryBuffer,
+    ) -> Result<ReplacementLeaves> {
+        if core::any::TypeId::of::<K>()
+            != core::any::TypeId::of::<crate::transactions::TransactionIdWithPagination>()
+            || core::any::TypeId::of::<V>()
+                != core::any::TypeId::of::<crate::transactions::PageList<'static>>()
+        {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        // Both checkouts precede any builder, allocation or tree mutation.
+        let (mut plan, mut leaves) = self.page_allocator.prepare_fixed_packing()?;
+        let fixed_key = K::fixed_width();
+        let fixed_value = V::fixed_width();
+        let page_size = self.page_allocator.get_page_size();
+        let mut start = 0;
+        let mut bytes: usize = 0;
+        for index in 0..buffer.num_pairs() {
+            let (key, value) = buffer.entry_at(index).expect("buffered entry");
+            let entry_bytes = key
+                .len()
+                .checked_add(value.len())
+                .ok_or_else(crate::tree_store::source_owner_refused)?;
+            let prospective = bytes
+                .checked_add(entry_bytes)
+                .ok_or_else(crate::tree_store::source_owner_refused)?;
+            if leaf_split_required(
+                index - start + 1,
+                prospective,
+                fixed_key,
+                fixed_value,
+                page_size,
+            ) {
+                plan.try_push(start..index)?;
+                start = index;
+                bytes = 0;
+            }
+            bytes = bytes
+                .checked_add(entry_bytes)
+                .ok_or_else(crate::tree_store::source_owner_refused)?;
+        }
+        if start < buffer.num_pairs() {
+            plan.try_push(start..buffer.num_pairs())?;
+        }
+        let mut balance_tail = None;
+        if plan.len() >= 2 {
+            let last = plan.last().expect("last planned page");
+            let last_bytes = last
+                .clone()
+                .map(|index| {
+                    let (key, value) = buffer.entry_at(index).expect("buffered entry");
+                    key.len() + value.len()
+                })
+                .sum();
+            if leaf_below_merge_threshold(last.len(), last_bytes, fixed_key, fixed_value, page_size)
+            {
+                let last = plan.pop().expect("last planned page");
+                let previous = plan.pop().expect("previous planned page");
+                balance_tail = Some(previous.start..last.end);
+            }
+        }
+        let fill = |range: &Range<usize>| {
+            let mut builder = LeafBuilder::new(
+                self.page_allocator,
+                self.allocated,
+                range.len(),
+                fixed_key,
+                fixed_value,
+            );
+            for index in range.clone() {
+                let (key, value) = buffer.entry_at(index).expect("buffered entry");
+                builder.push(key, value);
+            }
+            builder
+        };
+        let key = |bytes: &[u8]| -> Result<[u8; 16]> {
+            bytes
+                .try_into()
+                .map_err(|_| crate::tree_store::source_owner_refused())
+        };
+        for range in plan.iter() {
+            let page = fill(range).build()?;
+            // Same fixed-width branch separator as the ordinary algorithm.
+            let upper = key(buffer
+                .entry_at(range.end - 1)
+                .expect("last buffered entry")
+                .0)?;
+            leaves.try_push(FixedPackedLeaf {
+                page: page.get_page_number(),
+                upper,
+            })?;
+        }
+        if let Some(range) = balance_tail {
+            let (left, separator, right) = fill(&range).build_split::<K>()?;
+            leaves.try_push(FixedPackedLeaf {
+                page: left.get_page_number(),
+                upper: key(separator.as_ref())?,
+            })?;
+            leaves.try_push(FixedPackedLeaf {
+                page: right.get_page_number(),
+                upper: key(buffer
+                    .entry_at(range.end - 1)
+                    .expect("last buffered entry")
+                    .0)?,
+            })?;
+        }
+        Ok(ReplacementLeaves::Source(leaves))
     }
 
     // Replaces the leaf at the end of `path` (all of the tree when `replaced`
@@ -490,7 +675,11 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         assert!(entries.num_pairs() > 0);
         assert_eq!(replaced.is_some(), self.root.is_some());
         let length = self.root.map_or(0, |header| header.length);
-        let leaves = self.build_replacement_leaves(entries)?;
+        let leaves = match self.build_replacement_leaves(entries)? {
+            ReplacementLeaves::Ordinary(leaves) => leaves,
+            #[cfg(not(redb_no_std))]
+            ReplacementLeaves::Source(_) => return Err(crate::tree_store::source_owner_refused()),
+        };
         let mut nodes: Vec<SplicedNode> = leaves
             .into_iter()
             .map(|(page, bound)| (page, DEFERRED, Some(bound)))
@@ -657,12 +846,12 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                 self.allocated,
                 chunk.len(),
                 K::fixed_width(),
-            );
+            )?;
             for (page, checksum, _) in chunk {
-                builder.push_child(*page, *checksum);
+                builder.push_child(*page, *checksum)?;
             }
             for node in &chunk[..chunk.len() - 1] {
-                builder.push_key(separator(node));
+                builder.push_key(separator(node))?;
             }
             let page = builder.build()?;
             nodes.push((
@@ -680,6 +869,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         key: &K::SelfType<'_>,
         value: &V::SelfType<'_>,
     ) -> Result<(Option<AccessGuard<'a, V>>, AccessGuardMutInPlace<'a, V>)> {
+        self.page_allocator.require_closed_branch_key::<K>()?;
         let (new_root, old_value, guard) = if let Some(BtreeHeader {
             root: p,
             checksum,
@@ -702,10 +892,10 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
 
             let new_root = if let Some((key, page2, page2_checksum)) = result.additional_sibling {
                 let mut builder =
-                    BranchBuilder::new(self.page_allocator, self.allocated, 2, K::fixed_width());
-                builder.push_child(result.new_root, result.root_checksum);
-                builder.push_key(&key);
-                builder.push_child(page2, page2_checksum);
+                    BranchBuilder::new(self.page_allocator, self.allocated, 2, K::fixed_width())?;
+                builder.push_child(result.new_root, result.root_checksum)?;
+                builder.push_key(key.as_slice())?;
+                builder.push_child(page2, page2_checksum)?;
                 let new_page = builder.build()?;
                 BtreeHeader::new(new_page.get_page_number(), DEFERRED, new_length)
             } else {
@@ -771,9 +961,13 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     let offset = new_page_accessor.offset_of_first_value();
                     let guard = AccessGuardMutInPlace::new(new_page, offset, value.len());
                     return if position == 0 {
-                        let split_key =
-                            branch_separator::<K>(key, accessor.entry(0).unwrap().key())
-                                .into_owned();
+                        let split_key = OwnedSeparator::from_cow(
+                            branch_separator::<K>(key, accessor.entry(0).unwrap().key()),
+                            self.page_allocator,
+                        )?;
+                        #[cfg(all(test, not(redb_no_std)))]
+                        self.page_allocator
+                            .observe_split_key_for_test(split_key.is_prepared());
                         Ok(InsertionResult {
                             new_root: new_page_number,
                             root_checksum: DEFERRED,
@@ -786,8 +980,13 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                             old_value: None,
                         })
                     } else {
-                        let split_key =
-                            branch_separator::<K>(accessor.last_entry().key(), key).into_owned();
+                        let split_key = OwnedSeparator::from_cow(
+                            branch_separator::<K>(accessor.last_entry().key(), key),
+                            self.page_allocator,
+                        )?;
+                        #[cfg(all(test, not(redb_no_std)))]
+                        self.page_allocator
+                            .observe_split_key_for_test(split_key.is_prepared());
                         Ok(InsertionResult {
                             new_root: page.get_page_number(),
                             root_checksum: page_checksum,
@@ -822,8 +1021,10 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                 if self.page_allocator.uncommitted(page.get_page_number()) && has_inplace_space() {
                     let page_number = page.get_page_number();
                     let existing_value = if found {
-                        let copied_value = accessor.entry(position).unwrap().value().to_vec();
-                        Some(AccessGuard::with_owned_value(copied_value))
+                        let copied_value = self
+                            .page_allocator
+                            .copy_return_bytes(accessor.entry(position).unwrap().value())?;
+                        Some(AccessGuard::with_owned_bytes(copied_value))
                     } else {
                         None
                     };
@@ -894,8 +1095,13 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                         self.page_allocator.get_page_size(),
                     )
                 {
-                    let split_key =
-                        branch_separator::<K>(accessor.last_entry().key(), key).into_owned();
+                    let split_key = OwnedSeparator::from_cow(
+                        branch_separator::<K>(accessor.last_entry().key(), key),
+                        self.page_allocator,
+                    )?;
+                    #[cfg(all(test, not(redb_no_std)))]
+                    self.page_allocator
+                        .observe_split_key_for_test(split_key.is_prepared());
                     let mut builder = LeafBuilder::new(
                         self.page_allocator,
                         self.allocated,
@@ -974,7 +1180,10 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     }
                 } else {
                     let (new_page1, split_key, new_page2) = builder.build_split::<K>()?;
-                    let split_key = split_key.to_vec();
+                    let split_key = OwnedSeparator::copy(split_key.as_ref(), self.page_allocator)?;
+                    #[cfg(all(test, not(redb_no_std)))]
+                    self.page_allocator
+                        .observe_split_key_for_test(split_key.is_prepared());
                     let page_number = page.get_page_number();
                     let existing_value = if found {
                         let (start, end) = accessor.value_range(position).unwrap();
@@ -1106,37 +1315,37 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     self.allocated,
                     accessor.count_children() + 1,
                     K::fixed_width(),
-                );
+                )?;
                 if child_index == 0 {
-                    builder.push_child(sub_result.new_root, sub_result.root_checksum);
+                    builder.push_child(sub_result.new_root, sub_result.root_checksum)?;
                     if let Some((ref index_key2, page2, page2_checksum)) =
                         sub_result.additional_sibling
                     {
-                        builder.push_key(index_key2);
-                        builder.push_child(page2, page2_checksum);
+                        builder.push_key(index_key2.as_slice())?;
+                        builder.push_child(page2, page2_checksum)?;
                     }
                 } else {
                     builder.push_child(
                         accessor.child_page(0).unwrap(),
                         accessor.child_checksum(0).unwrap(),
-                    );
+                    )?;
                 }
                 for i in 1..accessor.count_children() {
                     if let Some(key) = accessor.key(i - 1) {
-                        builder.push_key(key);
+                        builder.push_key(key)?;
                         if i == child_index {
-                            builder.push_child(sub_result.new_root, sub_result.root_checksum);
+                            builder.push_child(sub_result.new_root, sub_result.root_checksum)?;
                             if let Some((ref index_key2, page2, page2_checksum)) =
                                 sub_result.additional_sibling
                             {
-                                builder.push_key(index_key2);
-                                builder.push_child(page2, page2_checksum);
+                                builder.push_key(index_key2.as_slice())?;
+                                builder.push_child(page2, page2_checksum)?;
                             }
                         } else {
                             builder.push_child(
                                 accessor.child_page(i).unwrap(),
                                 accessor.child_checksum(i).unwrap(),
-                            );
+                            )?;
                         }
                     } else {
                         unreachable!();
@@ -1145,11 +1354,15 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
 
                 let result = if builder.should_split() {
                     let (new_page1, split_key, new_page2) = builder.build_split()?;
+                    let split_key = split_key.into_owned_separator();
+                    #[cfg(all(test, not(redb_no_std)))]
+                    self.page_allocator
+                        .observe_split_key_for_test(split_key.is_prepared());
                     InsertionResult {
                         new_root: new_page1.get_page_number(),
                         root_checksum: DEFERRED,
                         additional_sibling: Some((
-                            split_key.to_vec(),
+                            split_key,
                             new_page2.get_page_number(),
                             DEFERRED,
                         )),
@@ -1248,8 +1461,9 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             let key_guard = if want_key {
                 // The returned value guard owns the mutable page and removes the entry on drop,
                 // so we can't hand the key back as a borrow into the same page. Copy it instead.
-                Some(AccessGuard::with_owned_value(
-                    accessor.entry(position).unwrap().key().to_vec(),
+                Some(AccessGuard::with_owned_bytes(
+                    self.page_allocator
+                        .copy_return_bytes(accessor.entry(position).unwrap().key())?,
                 ))
             } else {
                 None
@@ -1493,8 +1707,8 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                 self.allocated,
                 accessor.count_children(),
                 K::fixed_width(),
-            );
-            builder.push_all(&accessor);
+            )?;
+            builder.push_all(&accessor)?;
             builder.replace_child(child_index, new_child, DEFERRED);
             let new_page = builder.build()?;
             Ok((new_page.get_page_number(), true))
@@ -1507,6 +1721,8 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         child_index: usize,
         result: DeletionResult,
     ) -> Result<DeletionResult> {
+        #[cfg(all(test, not(redb_no_std)))]
+        let _partial_trace = result.trace_partial(self.page_allocator);
         let original_page_number = page.get_page_number();
         if let Subtree(new_child) = result {
             let (result_page, replaced) =
@@ -1524,7 +1740,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             self.allocated,
             accessor.count_children(),
             K::fixed_width(),
-        );
+        )?;
 
         let final_result = match result {
             Subtree(_) => {
@@ -1539,7 +1755,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     builder.push_child(
                         accessor.child_page(i).unwrap(),
                         accessor.child_checksum(i).unwrap(),
-                    );
+                    )?;
                 }
                 let end = if child_index == accessor.count_children() - 1 {
                     // Skip the last key, which precedes the child
@@ -1551,7 +1767,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     if i == child_index {
                         continue;
                     }
-                    builder.push_key(accessor.key(i).unwrap());
+                    builder.push_key(accessor.key(i).unwrap())?;
                 }
                 Self::finalize_branch_builder(builder, self.page_allocator.get_page_size())?
             }
@@ -1588,7 +1804,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                         &deleted_pairs,
                     );
                     let new_page = child_builder.build()?;
-                    builder.push_all(&accessor);
+                    builder.push_all(&accessor)?;
                     builder.replace_child(child_index, new_page.get_page_number(), DEFERRED);
 
                     let result = Self::finalize_branch_builder(
@@ -1635,22 +1851,22 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                         if child_builder.should_split() {
                             let (new_page1, split_key, new_page2) =
                                 child_builder.build_split::<K>()?;
-                            builder.push_key(split_key);
-                            builder.push_child(new_page1.get_page_number(), DEFERRED);
-                            builder.push_child(new_page2.get_page_number(), DEFERRED);
+                            builder.push_key(split_key)?;
+                            builder.push_child(new_page1.get_page_number(), DEFERRED)?;
+                            builder.push_child(new_page2.get_page_number(), DEFERRED)?;
                         } else {
                             let new_page = child_builder.build()?;
-                            builder.push_child(new_page.get_page_number(), DEFERRED);
+                            builder.push_child(new_page.get_page_number(), DEFERRED)?;
                         }
 
                         let merged_key_index = max(child_index, merge_with);
                         if merged_key_index < accessor.count_children() - 1 {
-                            builder.push_key(accessor.key(merged_key_index).unwrap());
+                            builder.push_key(accessor.key(merged_key_index).unwrap())?;
                         }
                     } else {
-                        builder.push_child(page_number, page_checksum);
+                        builder.push_child(page_number, page_checksum)?;
                         if i < accessor.count_children() - 1 {
-                            builder.push_key(accessor.key(i).unwrap());
+                            builder.push_key(accessor.key(i).unwrap())?;
                         }
                     }
                 }
@@ -1684,35 +1900,35 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                             self.allocated,
                             merge_with_accessor.count_children() + 1,
                             K::fixed_width(),
-                        );
+                        )?;
                         let separator_key = accessor.key(min(child_index, merge_with)).unwrap();
                         if child_index < merge_with {
-                            child_builder.push_child(only_grandchild, grandchild_checksum);
-                            child_builder.push_key(separator_key);
+                            child_builder.push_child(only_grandchild, grandchild_checksum)?;
+                            child_builder.push_key(separator_key)?;
                         }
-                        child_builder.push_all(&merge_with_accessor);
+                        child_builder.push_all(&merge_with_accessor)?;
                         if child_index > merge_with {
-                            child_builder.push_key(separator_key);
-                            child_builder.push_child(only_grandchild, grandchild_checksum);
+                            child_builder.push_key(separator_key)?;
+                            child_builder.push_child(only_grandchild, grandchild_checksum)?;
                         }
                         if child_builder.should_split() {
                             let (new_page1, separator, new_page2) = child_builder.build_split()?;
-                            builder.push_child(new_page1.get_page_number(), DEFERRED);
-                            builder.push_key(separator);
-                            builder.push_child(new_page2.get_page_number(), DEFERRED);
+                            builder.push_child(new_page1.get_page_number(), DEFERRED)?;
+                            builder.push_split_key(separator)?;
+                            builder.push_child(new_page2.get_page_number(), DEFERRED)?;
                         } else {
                             let new_page = child_builder.build()?;
-                            builder.push_child(new_page.get_page_number(), DEFERRED);
+                            builder.push_child(new_page.get_page_number(), DEFERRED)?;
                         }
 
                         let merged_key_index = max(child_index, merge_with);
                         if merged_key_index < accessor.count_children() - 1 {
-                            builder.push_key(accessor.key(merged_key_index).unwrap());
+                            builder.push_key(accessor.key(merged_key_index).unwrap())?;
                         }
                     } else {
-                        builder.push_child(page_number, page_checksum);
+                        builder.push_child(page_number, page_checksum)?;
                         if i < accessor.count_children() - 1 {
-                            builder.push_key(accessor.key(i).unwrap());
+                            builder.push_key(accessor.key(i).unwrap())?;
                         }
                     }
                 }
@@ -1747,45 +1963,45 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                             self.allocated,
                             merge_with_accessor.count_children() + partial_children.len(),
                             K::fixed_width(),
-                        );
+                        )?;
                         let separator_key = accessor.key(min(child_index, merge_with)).unwrap();
                         if child_index < merge_with {
                             for &(child, child_checksum) in &partial_children {
-                                child_builder.push_child(child, child_checksum);
+                                child_builder.push_child(child, child_checksum)?;
                             }
-                            for key in &partial_keys {
-                                child_builder.push_key(key);
+                            for key in partial_keys.iter() {
+                                child_builder.push_key(key)?;
                             }
-                            child_builder.push_key(separator_key);
+                            child_builder.push_key(separator_key)?;
                         }
-                        child_builder.push_all(&merge_with_accessor);
+                        child_builder.push_all(&merge_with_accessor)?;
                         if child_index > merge_with {
-                            child_builder.push_key(separator_key);
+                            child_builder.push_key(separator_key)?;
                             for &(child, child_checksum) in &partial_children {
-                                child_builder.push_child(child, child_checksum);
+                                child_builder.push_child(child, child_checksum)?;
                             }
-                            for key in &partial_keys {
-                                child_builder.push_key(key);
+                            for key in partial_keys.iter() {
+                                child_builder.push_key(key)?;
                             }
                         }
                         if child_builder.should_split() {
                             let (new_page1, separator, new_page2) = child_builder.build_split()?;
-                            builder.push_child(new_page1.get_page_number(), DEFERRED);
-                            builder.push_key(separator);
-                            builder.push_child(new_page2.get_page_number(), DEFERRED);
+                            builder.push_child(new_page1.get_page_number(), DEFERRED)?;
+                            builder.push_split_key(separator)?;
+                            builder.push_child(new_page2.get_page_number(), DEFERRED)?;
                         } else {
                             let new_page = child_builder.build()?;
-                            builder.push_child(new_page.get_page_number(), DEFERRED);
+                            builder.push_child(new_page.get_page_number(), DEFERRED)?;
                         }
 
                         let merged_key_index = max(child_index, merge_with);
                         if merged_key_index < accessor.count_children() - 1 {
-                            builder.push_key(accessor.key(merged_key_index).unwrap());
+                            builder.push_key(accessor.key(merged_key_index).unwrap())?;
                         }
                     } else {
-                        builder.push_child(page_number, page_checksum);
+                        builder.push_child(page_number, page_checksum)?;
                         if i < accessor.count_children() - 1 {
-                            builder.push_key(accessor.key(i).unwrap());
+                            builder.push_key(accessor.key(i).unwrap())?;
                         }
                     }
                 }
@@ -1862,8 +2078,8 @@ mod tests {
 
     fn pack_branches(children: &[SplicedNode], page_allocator: &PageAllocator) -> Vec<SplicedNode> {
         let mut root = None;
-        let mut freed = vec![];
-        let allocated = Arc::new(PageTracker::new_tracking());
+        let mut freed = NativeOwnedPageVec::default();
+        let allocated = NativeOwnedShared::ordinary(PageTracker::new_tracking());
         let mut helper: MutateHelper<'_, '_, u64, u64> =
             MutateHelper::new(&mut root, page_allocator, &mut freed, &allocated);
         helper.build_branch_nodes(children).unwrap()

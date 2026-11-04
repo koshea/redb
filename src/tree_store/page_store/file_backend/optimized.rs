@@ -75,6 +75,75 @@ pub struct FileBackend {
 }
 
 impl FileBackend {
+    // Only the closed readonly custody constructor uses this class: fresh
+    // tracker, ONE native FULL_RANGE insertion, no erase/reinsert before Drop.
+    // Numeric storage only; no file/lock/caller freshness stamp or authority.
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn fresh_readonly_full_range_capacity_bytes()
+    -> Result<u64, super::super::allocator_reopen_facts::AllocatorResourceError> {
+        use super::super::{container_bounds, read_only_resource::map_bound};
+        super::super::resource_build_profile::NativeResourceBuildProfile::require()
+            .map_err(map_bound)?;
+        container_bounds::hash_fresh_reserve_storage::<(Bound<u64>, Bound<u64>)>(1)
+            .map(|bound| bound.allocator_bytes)
+            .map_err(map_bound)
+    }
+    // Callable only within Native; the sole public route is the closed
+    // FullRangeFileCustody owner which cannot erase/reinsert tracker entries.
+    pub(crate) fn full_range_custody_quote_capture_bytes() -> Result<u64, crate::ReadOnlyReopenError>
+    {
+        use super::super::container_bounds::{AllocationBound, ContainerBoundError};
+        use super::super::read_only_resource::ReadOnlyResourceProfile;
+        let common = ReadOnlyResourceProfile::read_context_capture_control_bytes()?;
+        let specific = core::mem::size_of::<(
+            usize,
+            (Bound<u64>, Bound<u64>),
+            Result<AllocationBound, ContainerBoundError>,
+            Result<u64, crate::ReadOnlyReopenError>,
+        )>();
+        common
+            .checked_add(u64::try_from(specific).map_err(|_| crate::ReadOnlyReopenError::Overflow)?)
+            .ok_or(crate::ReadOnlyReopenError::Overflow)
+    }
+
+    pub(crate) fn full_range_custody_retained_bytes(
+        &self,
+    ) -> Result<u64, crate::ReadOnlyReopenError> {
+        use super::super::container_bounds::{self, ContainerBoundError};
+        use super::super::read_only_resource::ReadOnlyResourceProfile;
+        use super::super::resource_build_profile::NativeResourceBuildProfile;
+        use crate::ReadOnlyReopenError;
+        fn bound(error: ContainerBoundError) -> ReadOnlyReopenError {
+            match error {
+                ContainerBoundError::Overflow => ReadOnlyReopenError::Overflow,
+                _ => ReadOnlyReopenError::Unsupported,
+            }
+        }
+        NativeResourceBuildProfile::require().map_err(bound)?;
+        let ranges = self
+            .locked_ranges
+            .lock()
+            .map_err(|_| ReadOnlyReopenError::Stale)?;
+        let full = (Bound::Unbounded, Bound::Unbounded);
+        // A fallback-only flock does not establish this one-native-range
+        // resource profile. Ordinary acquire still succeeds on that platform.
+        if ranges.len() != 1 || !ranges.contains(&full) {
+            return Err(ReadOnlyReopenError::Unsupported);
+        }
+        // This is historical FRESH capacity because the closed owner performs
+        // one insertion and has no erase/reinsert/mutating operation until Drop.
+        let tracked = container_bounds::hash_storage_from_historical_fresh_capacity::<(
+            Bound<u64>,
+            Bound<u64>,
+        )>(ranges.capacity())
+        .map_err(bound)?;
+        let header =
+            ReadOnlyResourceProfile::typed_allocation::<crate::backends::FullRangeFileCustody>()?;
+        header
+            .checked_add(tracked.allocator_bytes)
+            .ok_or(ReadOnlyReopenError::Overflow)
+    }
+
     /// Creates a new backend which stores data to the given file.
     pub fn new(file: File) -> Result<Self, DatabaseError> {
         Ok(Self {
@@ -82,6 +151,18 @@ impl FileBackend {
             locked_ranges: Mutex::new(HashSet::new()),
             file,
         })
+    }
+
+    // The closed readonly custody owner already holds an exclusive legacy flock.
+    // Never fall back to a shared whole-file lock on its duplicate descriptor:
+    // doing so would downgrade that independently retained exclusion.
+    pub(crate) fn try_lock_shared_native_full_range(&self) -> Result<bool, BackendError> {
+        let range = (Bound::Unbounded, Bound::Unbounded);
+        #[cfg(windows)]
+        let acquired = self.try_lock_with_query_mutex(range, true);
+        #[cfg(not(windows))]
+        let acquired = self.try_lock_native(range, true);
+        acquired.map_err(BackendError::from)
     }
 
     // Best-effort 4.x compatibility: when a exclusive-writer open takes its suffix range,
@@ -1061,5 +1142,84 @@ mod range_lock_tests {
         let reader = open(tmpfile.path(), true).unwrap();
         close(&reader);
         holder.unlock().unwrap();
+    }
+
+    // req: STO-020, STO-032, REC-001
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closed_full_range_custody_releases_before_inherited_descriptor_dies() {
+        let fixture = crate::create_tempfile();
+        let file = reopen(fixture.path());
+        let inherited = file.try_clone().unwrap();
+        let owner = crate::backends::FullRangeFileCustody::acquire(file)
+            .unwrap()
+            .unwrap();
+        let observer = FileBackend::new(reopen(fixture.path())).unwrap();
+        assert!(!observer.try_lock_range(FULL_RANGE.0, FULL_RANGE.1).unwrap());
+        drop(owner);
+        assert!(observer.try_lock_range(FULL_RANGE.0, FULL_RANGE.1).unwrap());
+        close(&observer);
+        assert!(inherited.metadata().is_ok());
+        drop(inherited);
+    }
+
+    // req: STO-020, STO-032, REC-001
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closed_full_range_false_drops_only_its_attempt_and_preserves_owner() {
+        let fixture = crate::create_tempfile();
+        let owner = crate::backends::FullRangeFileCustody::acquire(reopen(fixture.path()))
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::backends::FullRangeFileCustody::acquire(reopen(fixture.path()))
+                .unwrap()
+                .is_none()
+        );
+        let observer = FileBackend::new(reopen(fixture.path())).unwrap();
+        assert!(!observer.try_lock_range(FULL_RANGE.0, FULL_RANGE.1).unwrap());
+        drop(owner);
+        assert!(observer.try_lock_range(FULL_RANGE.0, FULL_RANGE.1).unwrap());
+        close(&observer);
+    }
+
+    // req: STO-020, STO-032, REC-001
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closed_full_range_readonly_error_leaves_no_native_lock() {
+        let fixture = crate::create_tempfile();
+        let file = File::open(fixture.path()).unwrap();
+        let inherited = file.try_clone().unwrap();
+        // This PRIMARY exclusive-write range is deliberately distinct from the
+        // accepted O_RDONLY MAINTENANCE shared-native-range constructor.
+        assert!(crate::backends::FullRangeFileCustody::acquire(file).is_err());
+        let observer = FileBackend::new(reopen(fixture.path())).unwrap();
+        assert!(observer.try_lock_range(FULL_RANGE.0, FULL_RANGE.1).unwrap());
+        close(&observer);
+        assert!(inherited.metadata().is_ok());
+    }
+
+    // req: STO-020, STO-032, REC-001
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closed_full_range_quote_uses_one_fresh_set_capacity_and_typed_header() {
+        use super::super::super::{container_bounds, read_only_resource::ReadOnlyResourceProfile};
+        let fixture = crate::create_tempfile();
+        let owner = crate::backends::FullRangeFileCustody::acquire(reopen(fixture.path()))
+            .unwrap()
+            .unwrap();
+        let mut actual_fresh_set = std::collections::HashSet::new();
+        actual_fresh_set.insert(FULL_RANGE);
+        let expected = container_bounds::hash_storage_from_historical_fresh_capacity::<(
+            Bound<u64>,
+            Bound<u64>,
+        )>(actual_fresh_set.capacity())
+        .unwrap()
+        .allocator_bytes
+            + ReadOnlyResourceProfile::typed_allocation::<crate::backends::FullRangeFileCustody>()
+                .unwrap();
+        assert!(crate::backends::FullRangeFileCustody::quote_capture_bytes().unwrap() > 0);
+        assert_eq!(owner.retained_resource_bytes().unwrap(), expected);
+        assert_eq!(owner.retained_resource_bytes().unwrap(), expected);
     }
 }

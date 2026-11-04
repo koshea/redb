@@ -1,3 +1,6 @@
+use super::owned_branch_keys::{BranchKeys, BranchSplitKey, PartialBranchKeys};
+use crate::tree_store::NativeOwnedShared;
+use crate::tree_store::SharedPageBytes;
 use crate::tree_store::page_store::{
     MAX_PAIR_LENGTH, MAX_VALUE_LENGTH, Page, PageImpl, PageMut, xxh3_checksum,
 };
@@ -179,8 +182,8 @@ enum OnDrop {
 enum EitherPage<'txn> {
     Immutable(PageImpl),
     Mutable(PageMut<'txn>),
-    OwnedMemory(Vec<u8>),
-    ArcMemory(Arc<[u8]>),
+    OwnedMemory(crate::tree_store::NativeOwnedValueBytes),
+    ArcMemory(SharedPageBytes),
 }
 
 impl EitherPage<'_> {
@@ -206,6 +209,14 @@ pub struct AccessGuard<'a, V: Value + 'static> {
 }
 
 impl<'a, V: Value + 'static> AccessGuard<'a, V> {
+    #[cfg(not(redb_no_std))]
+    pub(super) fn encoded_value_bytes(&self) -> &[u8] {
+        &self.page.memory()[self.offset..(self.offset + self.len)]
+    }
+    pub(crate) fn encoded_value_len(&self) -> usize {
+        self.len
+    }
+
     pub(crate) fn with_page(page: PageImpl, range: Range<usize>) -> Self {
         Self {
             page: EitherPage::Immutable(page),
@@ -216,7 +227,7 @@ impl<'a, V: Value + 'static> AccessGuard<'a, V> {
         }
     }
 
-    pub(crate) fn with_arc_page(page: Arc<[u8]>, range: Range<usize>) -> Self {
+    pub(crate) fn with_arc_page(page: SharedPageBytes, range: Range<usize>) -> Self {
         Self {
             page: EitherPage::ArcMemory(page),
             offset: range.start,
@@ -227,6 +238,10 @@ impl<'a, V: Value + 'static> AccessGuard<'a, V> {
     }
 
     pub(crate) fn with_owned_value(value: Vec<u8>) -> Self {
+        Self::with_owned_bytes(crate::tree_store::NativeOwnedValueBytes::ordinary(value))
+    }
+
+    pub(crate) fn with_owned_bytes(value: crate::tree_store::NativeOwnedValueBytes) -> Self {
         let len = value.len();
         Self {
             page: EitherPage::OwnedMemory(value),
@@ -261,17 +276,17 @@ impl<'a, V: Value + 'static> AccessGuard<'a, V> {
         V::from_bytes(&self.page.memory()[self.offset..(self.offset + self.len)])
     }
 
-    pub(crate) fn arc_view(&self) -> (Arc<[u8]>, Range<usize>) {
+    pub(crate) fn arc_view(&self) -> (SharedPageBytes, Range<usize>) {
         match &self.page {
             EitherPage::Immutable(page) => (page.to_arc(), self.offset..(self.offset + self.len)),
             EitherPage::ArcMemory(arc) => (arc.clone(), self.offset..(self.offset + self.len)),
             EitherPage::OwnedMemory(vec) => {
                 let bytes = &vec[self.offset..(self.offset + self.len)];
-                (Arc::from(bytes), 0..self.len)
+                (Arc::<[u8]>::from(bytes).into(), 0..self.len)
             }
             EitherPage::Mutable(page) => {
                 let bytes = &page.memory()[self.offset..(self.offset + self.len)];
-                (Arc::from(bytes), 0..self.len)
+                (Arc::<[u8]>::from(bytes).into(), 0..self.len)
             }
         }
     }
@@ -304,7 +319,7 @@ pub struct AccessGuardMut<'a, V: Value + 'static> {
     entry_index: usize,
     parent: Option<(PageMut<'a>, usize)>,
     page_allocator: PageAllocator,
-    allocated: Arc<PageTracker>,
+    allocated: NativeOwnedShared<PageTracker>,
     root_ref: &'a mut BtreeHeader,
     key_width: Option<usize>,
     _value_type: PhantomData<V>,
@@ -319,7 +334,7 @@ impl<'a, V: Value + 'static> AccessGuardMut<'a, V> {
         entry_index: usize,
         parent: Option<(PageMut<'a>, usize)>,
         page_allocator: PageAllocator,
-        allocated: Arc<PageTracker>,
+        allocated: NativeOwnedShared<PageTracker>,
         root_ref: &'a mut BtreeHeader,
         key_width: Option<usize>,
     ) -> Self {
@@ -689,6 +704,8 @@ pub(super) struct LeafBuilder<'a, 'b> {
     total_value_bytes: usize,
     page_allocator: &'b PageAllocator,
     allocated_pages: &'b PageTracker,
+    #[cfg(all(test, not(redb_no_std)))]
+    _point_trace: Option<crate::tree_store::page_store::NativePointTraceScope>,
 }
 
 // Key-value pairs copied into owned memory, so they survive any tree mutation.
@@ -696,19 +713,59 @@ pub(super) struct LeafBuilder<'a, 'b> {
 // that are entirely greater at the back and prepends smaller ones at the
 // front; `data` grows append-only since the pair ranges are absolute offsets
 // into it.
+#[cfg(not(redb_no_std))]
+#[path = "owned_entry_buffer_source.rs"]
+mod owned_entry_buffer_source;
+#[cfg(not(redb_no_std))]
+pub(crate) use owned_entry_buffer_source::NativeEntryBufferPool;
+#[cfg(not(redb_no_std))]
+use owned_entry_buffer_source::SourceEntryCheckout;
+
 #[derive(Default)]
 pub(super) struct OwnedEntryBuffer {
     pairs: VecDeque<(Range<usize>, Range<usize>)>,
     data: Vec<u8>,
+    #[cfg(not(redb_no_std))]
+    source: Option<SourceEntryCheckout>,
 }
 
 impl OwnedEntryBuffer {
+    #[cfg(not(redb_no_std))]
+    fn from_source(source: SourceEntryCheckout) -> Self {
+        Self {
+            pairs: VecDeque::new(),
+            data: Vec::new(),
+            source: Some(source),
+        }
+    }
+    fn pairs(&self) -> &VecDeque<(Range<usize>, Range<usize>)> {
+        #[cfg(not(redb_no_std))]
+        if let Some(source) = &self.source {
+            return &source.buffers().pairs;
+        }
+        &self.pairs
+    }
+    fn data(&self) -> &Vec<u8> {
+        #[cfg(not(redb_no_std))]
+        if let Some(source) = &self.source {
+            return &source.buffers().data;
+        }
+        &self.data
+    }
+    fn data_mut(&mut self) -> &mut Vec<u8> {
+        #[cfg(not(redb_no_std))]
+        if let Some(source) = &mut self.source {
+            return &mut source.buffers_mut().data;
+        }
+        &mut self.data
+    }
     fn store(&mut self, key: &[u8], value: &[u8]) -> (Range<usize>, Range<usize>) {
-        let key_start = self.data.len();
-        self.data.extend_from_slice(key);
-        let key_end = self.data.len();
-        self.data.extend_from_slice(value);
-        let value_end = self.data.len();
+        let data = self.data_mut();
+        let key_start = data.len();
+        data.extend_from_slice(key);
+        let key_end = data.len();
+        data.extend_from_slice(value);
+        let value_end = data.len();
         (key_start..key_end, key_end..value_end)
     }
 
@@ -721,13 +778,29 @@ impl OwnedEntryBuffer {
         accessor: &LeafAccessor<'_>,
         removed_indexes: &[usize],
         back: bool,
-    ) {
+    ) -> Result<()> {
+        #[cfg(not(redb_no_std))]
+        if let Some(source) = &self.source {
+            source.require_extend(accessor, removed_indexes)?;
+        }
         debug_assert!(removed_indexes.windows(2).all(|pair| pair[0] < pair[1]));
         let num_pairs = accessor.num_pairs();
-        self.pairs.reserve(num_pairs - removed_indexes.len());
-        self.data.reserve(accessor.length_of_pairs(0, num_pairs));
-
-        let mut retained = Vec::with_capacity(num_pairs - removed_indexes.len());
+        #[cfg(not(redb_no_std))]
+        let mut retained = if let Some(source) = &mut self.source {
+            // The full capacity check above precedes ANY data copy or storage
+            // removal. This moves the admitted temporary without allocating.
+            core::mem::take(&mut source.buffers_mut().retained)
+        } else {
+            self.pairs.reserve(num_pairs - removed_indexes.len());
+            self.data.reserve(accessor.length_of_pairs(0, num_pairs));
+            Vec::with_capacity(num_pairs - removed_indexes.len())
+        };
+        #[cfg(redb_no_std)]
+        let mut retained = {
+            self.pairs.reserve(num_pairs - removed_indexes.len());
+            self.data.reserve(accessor.length_of_pairs(0, num_pairs));
+            Vec::with_capacity(num_pairs - removed_indexes.len())
+        };
         let mut next_removed = 0;
         for index in 0..num_pairs {
             if removed_indexes.get(next_removed) == Some(&index) {
@@ -738,6 +811,21 @@ impl OwnedEntryBuffer {
             retained.push(self.store(entry.key(), entry.value()));
         }
         debug_assert_eq!(next_removed, removed_indexes.len());
+        #[cfg(not(redb_no_std))]
+        if let Some(source) = &mut self.source {
+            let buffers = source.buffers_mut();
+            // reserve/extend and push_front cannot grow after require_extend.
+            // drain preserves the SAME preallocated temporary for the neighbor.
+            if back {
+                buffers.pairs.extend(retained.drain(..));
+            } else {
+                for pair in retained.drain(..).rev() {
+                    buffers.pairs.push_front(pair);
+                }
+            }
+            buffers.retained = retained;
+            return Ok(());
+        }
         if back {
             self.pairs.extend(retained);
         } else {
@@ -747,18 +835,32 @@ impl OwnedEntryBuffer {
                 self.pairs.push_front(pair);
             }
         }
+        Ok(())
     }
 
+    // Source InsertRun is excluded; only the closed sparse extension above is
+    // supported. Refuse before store() can write or allocate.
+    fn require_ordinary_insert_run(&self) -> Result<()> {
+        #[cfg(not(redb_no_std))]
+        if self.source.is_some() {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        Ok(())
+    }
     // Appends one pair, which must be greater than every buffered entry.
-    pub(super) fn push_back(&mut self, key: &[u8], value: &[u8]) {
+    pub(super) fn push_back(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.require_ordinary_insert_run()?;
         let pair = self.store(key, value);
         self.pairs.push_back(pair);
+        Ok(())
     }
 
     // Prepends one pair, which must be smaller than every buffered entry.
-    pub(super) fn push_front(&mut self, key: &[u8], value: &[u8]) {
+    pub(super) fn push_front(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.require_ordinary_insert_run()?;
         let pair = self.store(key, value);
         self.pairs.push_front(pair);
+        Ok(())
     }
 
     // Copies `range` of the leaf's pairs to one end of the buffer. The pairs
@@ -769,7 +871,8 @@ impl OwnedEntryBuffer {
         accessor: &LeafAccessor<'_>,
         range: Range<usize>,
         back: bool,
-    ) {
+    ) -> Result<()> {
+        self.require_ordinary_insert_run()?;
         self.pairs.reserve(range.len());
         self.data
             .reserve(accessor.length_of_pairs(range.start, range.end));
@@ -780,40 +883,44 @@ impl OwnedEntryBuffer {
                 self.pairs.push_back(pair);
             }
         } else {
-            // Prepending in reverse leaves the leaf's entries ascending at
-            // the front.
+            // Prepending in reverse leaves the leaf's entries ascending at the
+            // front.
             for index in range.rev() {
                 let entry = accessor.entry(index).unwrap();
                 let pair = self.store(entry.key(), entry.value());
                 self.pairs.push_front(pair);
             }
         }
+        Ok(())
     }
 
     pub(super) fn num_pairs(&self) -> usize {
-        self.pairs.len()
+        self.pairs().len()
     }
-
     pub(super) fn total_bytes(&self) -> usize {
-        self.data.len()
+        self.data().len()
     }
-
     pub(super) fn back(&self) -> Option<(&[u8], &[u8])> {
-        self.pairs
+        self.pairs()
             .back()
-            .map(|(key, value)| (&self.data[key.clone()], &self.data[value.clone()]))
+            .map(|(key, value)| (&self.data()[key.clone()], &self.data()[value.clone()]))
     }
-
     pub(super) fn front(&self) -> Option<(&[u8], &[u8])> {
-        self.pairs
+        self.pairs()
             .front()
-            .map(|(key, value)| (&self.data[key.clone()], &self.data[value.clone()]))
+            .map(|(key, value)| (&self.data()[key.clone()], &self.data()[value.clone()]))
     }
-
+    // Readonly indexing removes the replacement packer's temporary Vec of
+    // borrowed entry references. VecDeque::get is constant-time; no new parser.
+    pub(super) fn entry_at(&self, index: usize) -> Option<(&[u8], &[u8])> {
+        self.pairs()
+            .get(index)
+            .map(|(key, value)| (&self.data()[key.clone()], &self.data()[value.clone()]))
+    }
     pub(super) fn entries(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-        self.pairs
+        self.pairs()
             .iter()
-            .map(|(key, value)| (&self.data[key.clone()], &self.data[value.clone()]))
+            .map(|(key, value)| (&self.data()[key.clone()], &self.data()[value.clone()]))
     }
 }
 
@@ -834,14 +941,26 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
     ) -> Self {
+        let pairs = Vec::with_capacity(capacity);
+        #[cfg(all(test, not(redb_no_std)))]
+        let trace = page_allocator.point_trace().map(|t| {
+            t.scope(
+                0,
+                pairs.capacity() * core::mem::size_of::<(&[u8], &[u8])>(),
+                pairs.capacity(),
+                0,
+            )
+        });
         Self {
-            pairs: Vec::with_capacity(capacity),
+            pairs,
             fixed_key_size,
             fixed_value_size,
             total_key_bytes: 0,
             total_value_bytes: 0,
             page_allocator,
             allocated_pages,
+            #[cfg(all(test, not(redb_no_std)))]
+            _point_trace: trace,
         }
     }
 
@@ -849,6 +968,14 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
         self.total_key_bytes += key.len();
         self.total_value_bytes += value.len();
         self.pairs.push((key, value));
+        #[cfg(all(test, not(redb_no_std)))]
+        if let Some(trace) = &mut self._point_trace {
+            trace.observe_capacity(
+                self.pairs.capacity() * core::mem::size_of::<(&[u8], &[u8])>(),
+                self.pairs.capacity(),
+                0,
+            );
+        }
     }
 
     pub(super) fn push_all_except(
@@ -1941,12 +2068,14 @@ impl<'b, T: Page> BranchAccessor<'b, T> {
 }
 
 pub(super) struct BranchBuilder<'a, 'b> {
-    children: Vec<(PageNumber, Checksum)>,
-    keys: Vec<Cow<'a, [u8]>>,
+    children: super::fixed_scratch::ScratchVec<(PageNumber, Checksum)>,
+    keys: BranchKeys<'a>,
     total_key_bytes: usize,
     fixed_key_size: Option<usize>,
     page_allocator: &'b PageAllocator,
     allocated_pages: &'b PageTracker,
+    #[cfg(all(test, not(redb_no_std)))]
+    _point_trace: Option<crate::tree_store::page_store::NativePointTraceScope>,
 }
 
 impl<'a, 'b> BranchBuilder<'a, 'b> {
@@ -1955,40 +2084,91 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
         allocated_pages: &'b PageTracker,
         child_capacity: usize,
         fixed_key_size: Option<usize>,
-    ) -> Self {
-        Self {
-            children: Vec::with_capacity(child_capacity),
-            keys: Vec::with_capacity(child_capacity - 1),
+    ) -> Result<Self> {
+        #[cfg(not(redb_no_std))]
+        if page_allocator.is_checked_source() && child_capacity == 0 {
+            return Err(super::source_owner_refused());
+        }
+        let children = page_allocator.prepare_branch_children(child_capacity)?;
+        #[cfg(all(test, not(redb_no_std)))]
+        page_allocator.observe_branch_children_for_test(children.is_prepared(), false);
+        let keys = page_allocator.prepare_branch_keys(child_capacity - 1)?;
+        #[cfg(all(test, not(redb_no_std)))]
+        if keys.capacity() > 0 {
+            page_allocator.observe_branch_keys_for_test(keys.is_prepared(), false);
+        }
+        #[cfg(all(test, not(redb_no_std)))]
+        let trace = page_allocator.point_trace().map(|t| {
+            t.scope(
+                1,
+                children.capacity() * core::mem::size_of::<(PageNumber, Checksum)>()
+                    + keys.heap_capacity_bytes(),
+                children.capacity(),
+                keys.capacity(),
+            )
+        });
+        Ok(Self {
+            children,
+            keys,
             total_key_bytes: 0,
             fixed_key_size,
             page_allocator,
             allocated_pages,
-        }
+            #[cfg(all(test, not(redb_no_std)))]
+            _point_trace: trace,
+        })
     }
 
     pub(super) fn replace_child(&mut self, index: usize, child: PageNumber, checksum: Checksum) {
-        self.children[index] = (child, checksum);
+        self.children.as_mut_slice()[index] = (child, checksum);
     }
 
-    pub(super) fn push_child(&mut self, child: PageNumber, checksum: Checksum) {
-        self.children.push((child, checksum));
+    pub(super) fn push_child(&mut self, child: PageNumber, checksum: Checksum) -> Result<()> {
+        self.children.try_push((child, checksum))?;
+        #[cfg(all(test, not(redb_no_std)))]
+        self.observe_point_capacity();
+        Ok(())
     }
 
-    pub(super) fn push_key(&mut self, key: impl Into<Cow<'a, [u8]>>) {
+    pub(super) fn push_key(&mut self, key: impl Into<Cow<'a, [u8]>>) -> Result<()> {
         let key = key.into();
-        self.total_key_bytes += key.len();
-        self.keys.push(key);
+        let bytes = key.len();
+        self.keys.push(key)?;
+        self.total_key_bytes += bytes;
+        #[cfg(all(test, not(redb_no_std)))]
+        self.observe_point_capacity();
+        Ok(())
+    }
+    pub(super) fn push_split_key(&mut self, key: BranchSplitKey<'a>) -> Result<()> {
+        let bytes = key.len();
+        self.keys.push_split(key)?;
+        self.total_key_bytes += bytes;
+        #[cfg(all(test, not(redb_no_std)))]
+        self.observe_point_capacity();
+        Ok(())
     }
 
-    pub(super) fn push_all<T: Page>(&mut self, accessor: &'a BranchAccessor<'_, T>) {
+    #[cfg(all(test, not(redb_no_std)))]
+    fn observe_point_capacity(&mut self) {
+        if let Some(trace) = &mut self._point_trace {
+            trace.observe_capacity(
+                self.children.capacity() * core::mem::size_of::<(PageNumber, Checksum)>()
+                    + self.keys.heap_capacity_bytes(),
+                self.children.capacity(),
+                self.keys.capacity(),
+            );
+        }
+    }
+    pub(super) fn push_all<T: Page>(&mut self, accessor: &'a BranchAccessor<'_, T>) -> Result<()> {
         for i in 0..accessor.count_children() {
             let child = accessor.child_page(i).unwrap();
             let checksum = accessor.child_checksum(i).unwrap();
-            self.push_child(child, checksum);
+            self.push_child(child, checksum)?;
         }
         for i in 0..(accessor.count_children() - 1) {
-            self.push_key(accessor.key(i).unwrap());
+            self.push_key(accessor.key(i).unwrap())?;
         }
+        Ok(())
     }
 
     pub(super) fn to_single_child(&self) -> Option<(PageNumber, Checksum)> {
@@ -2003,8 +2183,26 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
         RawBranchBuilder::required_bytes(self.keys.len(), self.total_key_bytes, self.fixed_key_size)
     }
 
-    pub(super) fn into_parts(self) -> (Vec<(PageNumber, Checksum)>, Vec<Vec<u8>>) {
-        let owned_keys = self.keys.into_iter().map(Cow::into_owned).collect();
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        super::fixed_scratch::ScratchVec<(PageNumber, Checksum)>,
+        PartialBranchKeys,
+    ) {
+        #[cfg(all(test, not(redb_no_std)))]
+        self.page_allocator
+            .observe_branch_children_for_test(self.children.is_prepared(), true);
+        let owned_keys = self.keys.into_parts();
+        #[cfg(all(test, not(redb_no_std)))]
+        if owned_keys.iter().any(|key| !key.is_empty()) {
+            self.page_allocator
+                .observe_branch_keys_for_test(owned_keys.is_prepared(), true);
+        }
+        #[cfg(all(test, not(redb_no_std)))]
+        if let Some(trace) = self.page_allocator.point_trace() {
+            let (keys, bytes) = owned_keys.trace_conversion();
+            trace.conversion(keys, bytes);
+        }
         (self.children, owned_keys)
     }
 
@@ -2020,7 +2218,7 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
             RawBranchBuilder::new(page.memory_mut(), self.keys.len(), self.fixed_key_size);
         builder.write_first_page(self.children[0].0, self.children[0].1);
         for i in 1..self.children.len() {
-            let key = &self.keys[i - 1];
+            let key = self.keys.get(i - 1).expect("existing branch key");
             builder.write_nth_key(key.as_ref(), self.children[i].0, self.children[i].1, i - 1);
         }
         drop(builder);
@@ -2040,12 +2238,14 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
         (size > self.page_allocator.get_page_size() || too_many_keys) && self.keys.len() >= 3
     }
 
-    pub(super) fn build_split<'txn>(self) -> Result<(PageMut<'txn>, Cow<'a, [u8]>, PageMut<'txn>)> {
+    pub(super) fn build_split<'txn>(
+        self,
+    ) -> Result<(PageMut<'txn>, BranchSplitKey<'a>, PageMut<'txn>)> {
         assert_eq!(self.children.len(), self.keys.len() + 1);
         assert!(self.keys.len() >= 3);
         let division = self.keys.len() / 2;
         let first_split_key_len: usize = self.keys.iter().take(division).map(|k| k.len()).sum();
-        let division_key = self.keys[division].clone();
+        let division_key = self.keys.split_key(division, self.page_allocator)?;
         let second_split_key_len = self.total_key_bytes - first_split_key_len - division_key.len();
 
         let size =
@@ -2054,7 +2254,7 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
         let mut builder = RawBranchBuilder::new(page1.memory_mut(), division, self.fixed_key_size);
         builder.write_first_page(self.children[0].0, self.children[0].1);
         for i in 0..division {
-            let key = &self.keys[i];
+            let key = self.keys.get(i).expect("existing branch key");
             builder.write_nth_key(
                 key.as_ref(),
                 self.children[i + 1].0,
@@ -2077,7 +2277,7 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
         );
         builder.write_first_page(self.children[division + 1].0, self.children[division + 1].1);
         for i in (division + 1)..self.keys.len() {
-            let key = &self.keys[i];
+            let key = self.keys.get(i).expect("existing branch key");
             builder.write_nth_key(
                 key.as_ref(),
                 self.children[i + 1].0,
@@ -2517,11 +2717,14 @@ mod tests {
             &allocated_pages,
             num_children,
             u64::fixed_width(),
-        );
+        )
+        .unwrap();
         for i in 0..num_children {
-            builder.push_child(PageNumber::new(0, u32::try_from(i).unwrap(), 0), 0);
+            builder
+                .push_child(PageNumber::new(0, u32::try_from(i).unwrap(), 0), 0)
+                .unwrap();
             if i < keys.len() {
-                builder.push_key(&keys[i]);
+                builder.push_key(&keys[i]).unwrap();
             }
         }
         assert!(builder.should_split());
@@ -2537,4 +2740,70 @@ mod tests {
         assert!(accessor1.count_children() - 1 <= MAX_PAIRS);
         assert!(accessor2.count_children() - 1 <= MAX_PAIRS);
     }
+}
+
+// Closed byte/str point operations only. This quotes heap scratch, not pages,
+// native transaction controls, allocator growth, or a complete write peak.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativePointScratchUpper {
+    pub(crate) leaf_pairs: usize,
+    pub(crate) branch_children: usize,
+    pub(crate) branch_keys: usize,
+    pub(crate) owned_key_bytes: usize,
+    pub(crate) heap_bytes: u64,
+}
+pub(crate) fn point_mutator_scratch_upper(
+    pairs: usize,
+    terminals: usize,
+    branch_key_bytes: usize,
+    maximum_key: usize,
+    maximum_value: usize,
+) -> core::result::Result<NativePointScratchUpper, crate::tree_store::NativeKeyPathError> {
+    use crate::tree_store::NativeKeyPathError as E;
+    use crate::tree_store::page_store::{
+        point_byte_forest_bytes as forest, point_vector_bytes as vector,
+    };
+    let leaf_pairs = pairs.max(1);
+    let branch_children = terminals.checked_add(1).ok_or(E::Overflow)?.max(2);
+    let branch_keys = branch_children - 1;
+    // Delete unwinds with one parent and one child builder; insertion constructs
+    // its parent only AFTER the child builder is consumed. At most one leaf
+    // builder, two branch builders, and original/new PartialBranch storage can
+    // coexist at the owning into_parts conversion seam. The latter deliberately
+    // counts old Cow storage AND new Vec<Vec<u8>> storage: no iterator reuse.
+    let leaf = vector::<(&[u8], &[u8])>(leaf_pairs)?;
+    let branch = vector::<(PageNumber, Checksum)>(branch_children)?
+        .checked_add(vector::<Cow<'_, [u8]>>(branch_keys)?)
+        .ok_or(E::Overflow)?;
+    let partial = vector::<(PageNumber, Checksum)>(branch_children)?
+        .checked_add(vector::<Vec<u8>>(branch_keys)?)
+        .and_then(|n| {
+            forest(branch_keys, branch_key_bytes)
+                .ok()
+                .and_then(|k| n.checked_add(k))
+        })
+        .ok_or(E::Overflow)?;
+    // The child's owned split separator and its replacement to_vec can coexist;
+    // an in-place replacement's old value is independently owned until returned.
+    let heap_bytes = leaf
+        .checked_add(branch.checked_mul(2).ok_or(E::Overflow)?)
+        .and_then(|n| partial.checked_mul(2).and_then(|p| n.checked_add(p)))
+        .and_then(|n| {
+            vector::<u8>(maximum_key)
+                .ok()
+                .and_then(|k| k.checked_mul(2).and_then(|k| n.checked_add(k)))
+        })
+        .and_then(|n| {
+            vector::<u8>(maximum_value)
+                .ok()
+                .and_then(|v| n.checked_add(v))
+        })
+        .ok_or(E::Overflow)?;
+    Ok(NativePointScratchUpper {
+        leaf_pairs,
+        branch_children,
+        branch_keys,
+        owned_key_bytes: branch_key_bytes,
+        heap_bytes,
+    })
 }

@@ -1,13 +1,20 @@
+use super::allocator_reopen_facts::AllocatorParseRecorder;
+use super::owned_allocator_vec::NativeOwnedAllocatorVec;
 use crate::tree_store::page_store::xxh3_checksum;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
+#[path = "bitmap_parse.rs"]
+mod bitmap_parse;
+use bitmap_parse::U64BitmapEncodedLayout;
+pub(super) use bitmap_parse::{BtreeBitmapEncodedLayout, NativeEncodedChildren, read_encoded_u32};
+
 const HEIGHT_OFFSET: usize = 0;
 const END_OFFSETS: usize = HEIGHT_OFFSET + size_of::<u32>();
 
 pub(super) struct BtreeBitmap {
-    heights: Vec<U64GroupedBitmap>,
+    heights: NativeOwnedAllocatorVec<U64GroupedBitmap>,
 }
 
 // Stores a 64-way bit-tree of allocated ids.
@@ -18,6 +25,56 @@ pub(super) struct BtreeBitmap {
 // layer data: u64s
 // ...consecutive layers. Except for the last level, all sub-trees of the root must be complete
 impl BtreeBitmap {
+    pub(super) fn growth_quote(&self, mut new_len: u32) -> super::allocator_growth::GrowthResult {
+        use super::{allocator_growth as g, container_bounds as b};
+        if self.heights.is_empty() || self.heights.len() > 6 {
+            return Err(super::allocator_reopen_facts::AllocatorResourceError::Incomplete);
+        }
+        let mut result = g::unchanged(
+            b::vector_storage::<U64GroupedBitmap>(self.heights.capacity())
+                .map_err(g::map)?
+                .allocator_bytes,
+        );
+        for height in self.heights.iter().rev() {
+            let required = U64GroupedBitmap::required_words(new_len);
+            let quote = b::vector_pushes::<u64>(
+                height.data.capacity(),
+                height.data.len(),
+                required.saturating_sub(height.data.len()),
+            )
+            .map_err(g::map)?;
+            result = g::sum(result, quote)?;
+            new_len = new_len.div_ceil(64);
+        }
+        if new_len > 1 {
+            return Err(super::allocator_reopen_facts::AllocatorResourceError::Unsupported);
+        }
+        Ok(result)
+    }
+
+    pub(super) fn padded_new_quote(
+        mut pages: u32,
+        max_capacity: u32,
+    ) -> super::allocator_growth::GrowthResult {
+        use super::{allocator_growth as g, container_bounds as b};
+        if max_capacity == 0 || pages > max_capacity {
+            return Err(super::allocator_reopen_facts::AllocatorResourceError::Incomplete);
+        }
+        let heights = Self::height_for_capacity(max_capacity);
+        let mut result = b::vector_pushes::<U64GroupedBitmap>(0, 0, heights).map_err(g::map)?;
+        for _ in 0..heights {
+            result = g::sum(
+                result,
+                g::unchanged(
+                    b::vector_storage::<u64>(U64GroupedBitmap::required_words(pages))
+                        .map_err(g::map)?
+                        .allocator_bytes,
+                ),
+            )?;
+            pages = pages.div_ceil(64);
+        }
+        Ok(result)
+    }
     pub(crate) fn count_unset(&self) -> u32 {
         self.get_level(self.get_height() - 1).count_unset()
     }
@@ -93,65 +150,187 @@ impl BtreeBitmap {
     }
 
     pub(crate) fn from_bytes(data: &[u8]) -> Self {
-        let height = u32::from_le_bytes(
-            data[HEIGHT_OFFSET..(HEIGHT_OFFSET + size_of::<u32>())]
-                .try_into()
-                .unwrap(),
-        );
-
-        let mut metadata = END_OFFSETS;
-        let mut data_start = END_OFFSETS + (height as usize) * size_of::<u32>();
-
-        let mut heights = vec![];
-        for _ in 0..height {
-            let data_end = u32::from_le_bytes(
-                data[metadata..(metadata + size_of::<u32>())]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            heights.push(U64GroupedBitmap::from_bytes(&data[data_start..data_end]));
-            data_start = data_end;
-            metadata += size_of::<u32>();
-        }
-
-        Self { heights }
+        Self::from_bytes_recording(data, None)
     }
 
-    // Initializes a new allocator, with no ids free
-    pub(crate) fn new(mut num_pages: u32, mut capacity: u32) -> Self {
-        let mut heights = vec![];
+    pub(super) fn from_bytes_recording(
+        data: &[u8],
+        facts: Option<&mut AllocatorParseRecorder>,
+    ) -> Self {
+        let layout = BtreeBitmapEncodedLayout::ordinary(data);
+        #[cfg(not(redb_no_std))]
+        let value = Self::from_layout(layout, facts, None);
+        #[cfg(redb_no_std)]
+        let value = Self::from_layout(layout, facts);
+        value.expect("ordinary bitmap materialization has no fallible Source admission")
+    }
 
-        // Build from the leaf to root
+    #[cfg(not(redb_no_std))]
+    pub(super) fn from_bytes_source(
+        data: &[u8],
+        resources: &super::page_resources::NativePageResources,
+    ) -> crate::Result<Self> {
+        let layout = BtreeBitmapEncodedLayout::inspect(data)
+            .map_err(|_| super::page_resources::refused())?;
+        let _ = layout
+            .source_capacity_bound()
+            .map_err(|_| super::page_resources::refused())?;
+        Self::from_layout(layout, None, Some(resources))
+    }
+
+    pub(super) fn from_layout(
+        layout: BtreeBitmapEncodedLayout<'_>,
+        mut facts: Option<&mut AllocatorParseRecorder>,
+        #[cfg(not(redb_no_std))] resources: Option<&super::page_resources::NativePageResources>,
+    ) -> crate::Result<Self> {
+        #[cfg(not(redb_no_std))]
+        if resources.is_some() && !layout.is_checked() {
+            return Err(super::page_resources::refused());
+        }
+        #[cfg(not(redb_no_std))]
+        let mut heights = if let Some(resources) = resources {
+            NativeOwnedAllocatorVec::source(layout.count(), resources)?
+        } else {
+            NativeOwnedAllocatorVec::default()
+        };
+        #[cfg(redb_no_std)]
+        let mut heights = NativeOwnedAllocatorVec::default();
+        #[cfg(not(redb_no_std))]
+        if resources.is_some() {
+            if let Some(facts) = facts.as_deref_mut() {
+                facts.replace_vec::<U64GroupedBitmap>(0, heights.capacity());
+            }
+        }
+        for layer in layout.layers() {
+            let layer = layer.map_err(|_| super::page_resources::refused())?;
+            #[cfg(not(redb_no_std))]
+            let height = U64GroupedBitmap::from_layout(layer, facts.as_deref_mut(), resources)?;
+            #[cfg(redb_no_std)]
+            let height = U64GroupedBitmap::from_layout(layer, facts.as_deref_mut())?;
+            let old_capacity = heights.capacity();
+            heights.push(height);
+            if let Some(facts) = facts.as_deref_mut() {
+                facts.replace_vec::<U64GroupedBitmap>(old_capacity, heights.capacity());
+            }
+        }
+        Ok(Self { heights })
+    }
+
+    pub(super) fn record_capacity(&self, facts: &mut AllocatorParseRecorder) {
+        facts.replace_vec::<U64GroupedBitmap>(0, self.heights.capacity());
+        for height in &self.heights {
+            facts.replace_vec::<u64>(0, height.data.capacity());
+        }
+    }
+
+    // Sole constructor algorithm for normal and numerically guarded backing.
+    // Ordinary mode follows its original Vec push/insert allocations; Source
+    // mode admits the complete known outer capacity and each child beforehand.
+    fn initialize(
+        mut num_pages: u32,
+        mut capacity: u32,
+        max_capacity: u32,
+        #[cfg(not(redb_no_std))] resources: Option<&super::page_resources::NativePageResources>,
+    ) -> crate::Result<Self> {
+        let max_height = Self::height_for_capacity(max_capacity);
+        #[cfg(not(redb_no_std))]
+        let mut heights = if let Some(resources) = resources {
+            NativeOwnedAllocatorVec::source(max_height, resources)?
+        } else {
+            NativeOwnedAllocatorVec::default()
+        };
+        #[cfg(redb_no_std)]
+        let mut heights = NativeOwnedAllocatorVec::default();
         loop {
-            heights.push(U64GroupedBitmap::new_full(num_pages, capacity));
+            #[cfg(not(redb_no_std))]
+            let child = if let Some(resources) = resources {
+                U64GroupedBitmap::source_new_full(num_pages, capacity, resources)?
+            } else {
+                U64GroupedBitmap::new_full(num_pages, capacity)
+            };
+            #[cfg(redb_no_std)]
+            let child = U64GroupedBitmap::new_full(num_pages, capacity);
+            heights.push(child);
             if capacity <= 64 {
                 break;
             }
             capacity = capacity.div_ceil(64);
             num_pages = num_pages.div_ceil(64);
         }
-
-        // Reverse so that the root is at index 0
         heights.reverse();
-
-        Self { heights }
-    }
-
-    // Like new(), but pads the tree height for max_capacity so resize()
-    // never needs to insert new levels.
-    pub(crate) fn new_padded(num_pages: u32, capacity: u32, max_capacity: u32) -> Self {
-        let mut result = Self::new(num_pages, capacity);
-
-        let max_height = Self::height_for_capacity(max_capacity);
-        while result.heights.len() < max_height {
-            let root_len = result.heights[0].len();
-            let parent_len = root_len.div_ceil(64);
-            result
-                .heights
-                .insert(0, U64GroupedBitmap::new_full(parent_len, parent_len));
+        while heights.len() < max_height {
+            let parent_len = heights[0].len().div_ceil(64);
+            #[cfg(not(redb_no_std))]
+            let parent = if let Some(resources) = resources {
+                U64GroupedBitmap::source_new_full(parent_len, parent_len, resources)?
+            } else {
+                U64GroupedBitmap::new_full(parent_len, parent_len)
+            };
+            #[cfg(redb_no_std)]
+            let parent = U64GroupedBitmap::new_full(parent_len, parent_len);
+            heights.insert(0, parent);
         }
-
-        result
+        Ok(Self { heights })
+    }
+    // Initializes a new allocator, with no ids free.
+    pub(crate) fn new(num_pages: u32, capacity: u32) -> Self {
+        #[cfg(not(redb_no_std))]
+        let value = Self::initialize(num_pages, capacity, capacity, None);
+        #[cfg(redb_no_std)]
+        let value = Self::initialize(num_pages, capacity, capacity);
+        // None mode has no fallible admission or reserve. Its allocations are
+        // the original ordinary Vec operations, not a Source resource policy.
+        value.expect("ordinary bitmap initialization has no fallible Source admission")
+    }
+    pub(crate) fn new_padded(num_pages: u32, capacity: u32, max_capacity: u32) -> Self {
+        #[cfg(not(redb_no_std))]
+        let value = Self::initialize(num_pages, capacity, max_capacity, None);
+        #[cfg(redb_no_std)]
+        let value = Self::initialize(num_pages, capacity, max_capacity);
+        value.expect("ordinary padded bitmap initialization has no fallible Source admission")
+    }
+    #[cfg(not(redb_no_std))]
+    pub(super) fn source_new_padded(
+        num_pages: u32,
+        capacity: u32,
+        max_capacity: u32,
+        resources: &super::page_resources::NativePageResources,
+    ) -> crate::Result<Self> {
+        if capacity > max_capacity || num_pages > capacity || max_capacity == 0 {
+            return Err(super::page_resources::refused());
+        }
+        Self::initialize(num_pages, capacity, max_capacity, Some(resources))
+    }
+    #[cfg(not(redb_no_std))]
+    pub(super) fn prepare_source_resize(
+        &mut self,
+        mut new_len: u32,
+        resources: &super::page_resources::NativePageResources,
+    ) -> crate::Result<()> {
+        // Padded native heights do not grow during resize. Prepare only actual
+        // word arrays that need replacement, before any file/bitmap mutation.
+        for height in self.heights.iter_mut().rev() {
+            height.data.prepare_capacity(
+                U64GroupedBitmap::required_words(new_len).max(height.data.len()),
+                resources,
+            )?;
+            new_len = new_len.div_ceil(64);
+        }
+        if new_len > 1 {
+            return Err(super::page_resources::refused());
+        }
+        Ok(())
+    }
+    #[cfg(not(redb_no_std))]
+    pub(super) fn handoff_ordinary(
+        &mut self,
+        handoff: &mut super::owned_allocator_vec::NativeOrdinaryAllocatorHandoff,
+    ) -> crate::Result<()> {
+        self.heights.handoff_ordinary(handoff)?;
+        for height in &mut self.heights {
+            height.data.handoff_ordinary(handoff)?;
+        }
+        Ok(())
     }
 
     fn height_for_capacity(mut capacity: u32) -> usize {
@@ -231,7 +410,7 @@ fn bits_in_range(lo: u32, hi: u32) -> u64 {
 // A bitmap which groups consecutive groups of 64bits together
 pub(crate) struct U64GroupedBitmap {
     len: u32,
-    data: Vec<u64>,
+    data: NativeOwnedAllocatorVec<u64>,
 }
 
 impl U64GroupedBitmap {
@@ -242,7 +421,22 @@ impl U64GroupedBitmap {
 
     pub fn new_full(len: u32, capacity: u32) -> Self {
         let data = vec![u64::MAX; Self::required_words(capacity)];
-        Self { len, data }
+        Self {
+            len,
+            data: data.into(),
+        }
+    }
+
+    #[cfg(not(redb_no_std))]
+    fn source_new_full(
+        len: u32,
+        capacity: u32,
+        resources: &super::page_resources::NativePageResources,
+    ) -> crate::Result<Self> {
+        let words = Self::required_words(capacity);
+        let mut data = NativeOwnedAllocatorVec::source(words, resources)?;
+        data.resize(words, u64::MAX);
+        Ok(Self { len, data })
     }
 
     pub fn xxh3_hash(&self) -> u128 {
@@ -279,10 +473,37 @@ impl U64GroupedBitmap {
     }
 
     pub fn from_bytes(serialized: &[u8]) -> Self {
-        assert_eq!(0, (serialized.len() - size_of::<u32>()) % size_of::<u64>());
-        let len = u32::from_le_bytes(serialized[..size_of::<u32>()].try_into().unwrap());
-        let words = (serialized.len() - size_of::<u32>()) / size_of::<u64>();
-        let mut data = Vec::with_capacity(words);
+        Self::from_bytes_recording(serialized, None)
+    }
+
+    fn from_bytes_recording(serialized: &[u8], facts: Option<&mut AllocatorParseRecorder>) -> Self {
+        let layout = U64BitmapEncodedLayout::ordinary(serialized);
+        #[cfg(not(redb_no_std))]
+        let value = Self::from_layout(layout, facts, None);
+        #[cfg(redb_no_std)]
+        let value = Self::from_layout(layout, facts);
+        value.expect("ordinary grouped bitmap materialization has no fallible Source admission")
+    }
+
+    fn from_layout(
+        layout: U64BitmapEncodedLayout<'_>,
+        facts: Option<&mut AllocatorParseRecorder>,
+        #[cfg(not(redb_no_std))] resources: Option<&super::page_resources::NativePageResources>,
+    ) -> crate::Result<Self> {
+        let serialized = layout.encoded();
+        let len = layout.logical_len();
+        let words = layout.words();
+        #[cfg(not(redb_no_std))]
+        let mut data = if let Some(resources) = resources {
+            NativeOwnedAllocatorVec::source(words, resources)?
+        } else {
+            NativeOwnedAllocatorVec::from(Vec::with_capacity(words))
+        };
+        #[cfg(redb_no_std)]
+        let mut data = NativeOwnedAllocatorVec::from(Vec::with_capacity(words));
+        if let Some(facts) = facts {
+            facts.replace_vec::<u64>(0, data.capacity());
+        }
         for i in 0..words {
             let start = size_of::<u32>() + i * size_of::<u64>();
             let value = u64::from_le_bytes(
@@ -292,8 +513,7 @@ impl U64GroupedBitmap {
             );
             data.push(value);
         }
-
-        Self { len, data }
+        Ok(Self { len, data })
     }
 
     fn data_index_of(bit: u32) -> (usize, usize) {

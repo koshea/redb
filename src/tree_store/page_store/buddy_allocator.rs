@@ -1,5 +1,9 @@
+use super::allocator_reopen_facts::AllocatorParseRecorder;
+use super::owned_allocator_vec::NativeOwnedAllocatorVec;
 use crate::tree_store::PageNumber;
-use crate::tree_store::page_store::bitmap::BtreeBitmap;
+use crate::tree_store::page_store::bitmap::{
+    BtreeBitmap, BtreeBitmapEncodedLayout, NativeEncodedChildren, read_encoded_u32,
+};
 #[cfg(test)]
 use crate::tree_store::page_store::fast_hash::PageNumberHashSet;
 use crate::tree_store::page_store::page_manager::MAX_MAX_PAGE_ORDER;
@@ -12,6 +16,139 @@ const MAX_ORDER_OFFSET: usize = 0;
 const PADDING: usize = 3;
 const NUM_PAGES_OFFSET: usize = MAX_ORDER_OFFSET + size_of::<u8>() + PADDING;
 const FREE_END_OFFSETS: usize = NUM_PAGES_OFFSET + size_of::<u32>();
+
+// Borrowed native framing/capacity only, never an allocator or Source proof.
+#[derive(Clone, Copy)]
+pub(super) struct BuddyAllocatorEncodedLayout<'a> {
+    encoded: &'a [u8],
+    max_order: u8,
+    num_pages: u32,
+    checked: bool,
+    consumed_end: Option<usize>,
+}
+impl<'a> BuddyAllocatorEncodedLayout<'a> {
+    pub(super) fn inspect(
+        encoded: &'a [u8],
+    ) -> Result<Self, super::allocator_reopen_facts::AllocatorResourceError> {
+        use super::allocator_reopen_facts::AllocatorResourceError as E;
+        let max_order = *encoded.get(MAX_ORDER_OFFSET).ok_or(E::Incomplete)?;
+        let num_pages = read_encoded_u32(encoded, NUM_PAGES_OFFSET, true)?;
+        let count = usize::from(max_order) + 1;
+        let mut orders = NativeEncodedChildren::checked(encoded, FREE_END_OFFSETS, count)?;
+        for order in orders.by_ref() {
+            BtreeBitmapEncodedLayout::inspect(order?)?;
+        }
+        Ok(Self {
+            encoded,
+            max_order,
+            num_pages,
+            checked: true,
+            consumed_end: Some(orders.consumed_end()),
+        })
+    }
+    fn ordinary(encoded: &'a [u8]) -> Self {
+        let max_order = encoded[MAX_ORDER_OFFSET];
+        let num_pages = read_encoded_u32(encoded, NUM_PAGES_OFFSET, false)
+            .expect("ordinary fixed framing has no typed error");
+        let _ =
+            NativeEncodedChildren::ordinary(encoded, FREE_END_OFFSETS, usize::from(max_order) + 1);
+        Self {
+            encoded,
+            max_order,
+            num_pages,
+            checked: false,
+            consumed_end: None,
+        }
+    }
+    pub(super) fn consumed_end(self) -> Option<usize> {
+        self.consumed_end
+    }
+    fn count(self) -> usize {
+        usize::from(self.max_order) + 1
+    }
+    fn orders(self) -> BuddyBitmapOrders<'a> {
+        let children = if self.checked {
+            NativeEncodedChildren::checked(self.encoded, FREE_END_OFFSETS, self.count())
+                .expect("checked immutable Buddy layout")
+        } else {
+            NativeEncodedChildren::ordinary(self.encoded, FREE_END_OFFSETS, self.count())
+        };
+        BuddyBitmapOrders {
+            children,
+            checked: self.checked,
+        }
+    }
+    pub(super) fn source_resize_capacity_bound(
+        self,
+        mut new_pages: u32,
+    ) -> super::allocator_growth::GrowthResult {
+        use super::{allocator_growth as g, container_bounds as b};
+        let checked = if self.checked {
+            self
+        } else {
+            Self::inspect(self.encoded)?
+        };
+        if new_pages == 0 || checked.max_order > MAX_MAX_PAGE_ORDER {
+            return Err(super::allocator_reopen_facts::AllocatorResourceError::Incomplete);
+        }
+        if new_pages <= checked.num_pages {
+            return Ok(g::unchanged(checked.source_capacity_bound()?));
+        }
+        let mut result = g::unchanged(
+            b::vector_storage::<BtreeBitmap>(checked.count())
+                .map_err(g::map)?
+                .allocator_bytes,
+        );
+        for bitmap in checked.orders() {
+            result =
+                g::monotone_preparation(result, bitmap?.source_resize_capacity_bound(new_pages)?)?;
+            new_pages = next_higher_order(new_pages);
+        }
+        Ok(result)
+    }
+    pub(super) fn source_capacity_bound(
+        self,
+    ) -> Result<u64, super::allocator_reopen_facts::AllocatorResourceError> {
+        use super::allocator_reopen_facts::AllocatorResourceError as E;
+        use super::{
+            container_bounds as b, read_only_resource::map_bound,
+            resource_build_profile::NativeResourceBuildProfile,
+        };
+        let checked = if self.checked {
+            self
+        } else {
+            Self::inspect(self.encoded)?
+        };
+        NativeResourceBuildProfile::require().map_err(map_bound)?;
+        let mut total = b::vector_storage::<BtreeBitmap>(checked.count())
+            .map_err(map_bound)?
+            .allocator_bytes;
+        for order in checked.orders() {
+            total = total
+                .checked_add(order?.source_capacity_bound()?)
+                .ok_or(E::Overflow)?;
+        }
+        Ok(total)
+    }
+}
+struct BuddyBitmapOrders<'a> {
+    children: NativeEncodedChildren<'a>,
+    checked: bool,
+}
+impl<'a> Iterator for BuddyBitmapOrders<'a> {
+    type Item =
+        Result<BtreeBitmapEncodedLayout<'a>, super::allocator_reopen_facts::AllocatorResourceError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.children.next().map(|child| {
+            let child = child?;
+            if self.checked {
+                BtreeBitmapEncodedLayout::inspect(child)
+            } else {
+                Ok(BtreeBitmapEncodedLayout::ordinary(child))
+            }
+        })
+    }
+}
 
 fn calculate_usable_order(pages: u32) -> u8 {
     let max_order = (32 - pages.leading_zeros() - 1).try_into().unwrap();
@@ -30,32 +167,96 @@ fn buddy_page(page_number: u32) -> u32 {
 //
 // Pages are marked free at only a single order, and it must always be the largest order
 pub(crate) struct BuddyAllocator {
-    free: Vec<BtreeBitmap>,
+    free: NativeOwnedAllocatorVec<BtreeBitmap>,
     len: u32,
     max_order: u8,
 }
 
 impl BuddyAllocator {
-    pub(crate) fn new(num_pages: u32, max_page_capacity: u32) -> Self {
-        let max_order = calculate_usable_order(max_page_capacity);
+    pub(super) fn growth_quote(&self, mut pages: u32) -> super::allocator_growth::GrowthResult {
+        use super::{allocator_growth as g, container_bounds as b};
+        if pages == 0 || self.free.len() != usize::from(self.max_order) + 1 {
+            return Err(super::allocator_reopen_facts::AllocatorResourceError::Incomplete);
+        }
+        let mut result = g::unchanged(
+            b::vector_storage::<BtreeBitmap>(self.free.capacity())
+                .map_err(g::map)?
+                .allocator_bytes,
+        );
+        for bitmap in &self.free {
+            result = g::sum(result, bitmap.growth_quote(pages)?)?;
+            pages = next_higher_order(pages);
+        }
+        Ok(result)
+    }
 
+    pub(super) fn new_quote(
+        mut pages: u32,
+        mut capacity: u32,
+    ) -> super::allocator_growth::GrowthResult {
+        use super::{allocator_growth as g, container_bounds as b};
+        if pages == 0 || capacity == 0 || pages > capacity {
+            return Err(super::allocator_reopen_facts::AllocatorResourceError::Incomplete);
+        }
+        let orders = usize::from(calculate_usable_order(capacity)) + 1;
+        let mut result = b::vector_pushes::<BtreeBitmap>(0, 0, orders).map_err(g::map)?;
+        for _ in 0..orders {
+            result = g::sum(result, BtreeBitmap::padded_new_quote(pages, capacity)?)?;
+            pages = next_higher_order(pages);
+            capacity = next_higher_order(capacity);
+        }
+        Ok(result)
+    }
+    fn initialize(
+        num_pages: u32,
+        max_page_capacity: u32,
+        #[cfg(not(redb_no_std))] resources: Option<&super::page_resources::NativePageResources>,
+    ) -> crate::Result<Self> {
+        let max_order = calculate_usable_order(max_page_capacity);
         let mut capacity_for_order = max_page_capacity;
         let mut pages_for_order = num_pages;
-        let mut free = vec![];
+        #[cfg(not(redb_no_std))]
+        let mut free = if let Some(resources) = resources {
+            NativeOwnedAllocatorVec::source(usize::from(max_order) + 1, resources)?
+        } else {
+            NativeOwnedAllocatorVec::default()
+        };
+        #[cfg(redb_no_std)]
+        let mut free = NativeOwnedAllocatorVec::default();
         for _ in 0..=max_order {
-            // Lazily size each bitmap for the actual current pages, but pad the tree
-            // height so resize() can grow to the full region capacity without needing
-            // to insert new tree levels.
-            free.push(BtreeBitmap::new_padded(
-                pages_for_order,
-                pages_for_order,
-                capacity_for_order,
-            ));
-
+            #[cfg(not(redb_no_std))]
+            let bitmap = if let Some(resources) = resources {
+                BtreeBitmap::source_new_padded(
+                    pages_for_order,
+                    pages_for_order,
+                    capacity_for_order,
+                    resources,
+                )?
+            } else {
+                BtreeBitmap::new_padded(pages_for_order, pages_for_order, capacity_for_order)
+            };
+            #[cfg(redb_no_std)]
+            let bitmap =
+                BtreeBitmap::new_padded(pages_for_order, pages_for_order, capacity_for_order);
+            free.push(bitmap);
             pages_for_order = next_higher_order(pages_for_order);
             capacity_for_order = next_higher_order(capacity_for_order);
         }
+        Ok(Self::finish_new(free, num_pages, max_order))
+    }
+    pub(crate) fn new(num_pages: u32, max_page_capacity: u32) -> Self {
+        #[cfg(not(redb_no_std))]
+        let value = Self::initialize(num_pages, max_page_capacity, None);
+        #[cfg(redb_no_std)]
+        let value = Self::initialize(num_pages, max_page_capacity);
+        value.expect("ordinary buddy initialization has no fallible Source admission")
+    }
 
+    fn finish_new(
+        mut free: NativeOwnedAllocatorVec<BtreeBitmap>,
+        num_pages: u32,
+        max_order: u8,
+    ) -> Self {
         // Mark the available pages, starting with the highest order
         let mut accounted_pages = 0;
         for order in (0..=max_order).rev() {
@@ -73,6 +274,41 @@ impl BuddyAllocator {
             len: num_pages,
             max_order,
         }
+    }
+
+    #[cfg(not(redb_no_std))]
+    pub(super) fn source_new(
+        num_pages: u32,
+        max_page_capacity: u32,
+        resources: &super::page_resources::NativePageResources,
+    ) -> crate::Result<Self> {
+        if num_pages == 0 || num_pages > max_page_capacity {
+            return Err(super::page_resources::refused());
+        }
+        Self::initialize(num_pages, max_page_capacity, Some(resources))
+    }
+    #[cfg(not(redb_no_std))]
+    pub(super) fn prepare_source_resize(
+        &mut self,
+        mut pages: u32,
+        resources: &super::page_resources::NativePageResources,
+    ) -> crate::Result<()> {
+        for bitmap in &mut self.free {
+            bitmap.prepare_source_resize(pages, resources)?;
+            pages = next_higher_order(pages);
+        }
+        Ok(())
+    }
+    #[cfg(not(redb_no_std))]
+    pub(super) fn handoff_ordinary(
+        &mut self,
+        handoff: &mut super::owned_allocator_vec::NativeOrdinaryAllocatorHandoff,
+    ) -> crate::Result<()> {
+        self.free.handoff_ordinary(handoff)?;
+        for bitmap in &mut self.free {
+            bitmap.handoff_ordinary(handoff)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn xxh3_hash(&self) -> u128 {
@@ -116,32 +352,88 @@ impl BuddyAllocator {
     }
 
     pub(crate) fn from_bytes(data: &[u8]) -> Self {
-        let max_order = data[MAX_ORDER_OFFSET];
-        let num_pages = u32::from_le_bytes(
-            data[NUM_PAGES_OFFSET..(NUM_PAGES_OFFSET + size_of::<u32>())]
-                .try_into()
-                .unwrap(),
-        );
+        Self::from_bytes_recording(data, None)
+    }
 
-        let mut metadata = FREE_END_OFFSETS;
-        let mut data_start = FREE_END_OFFSETS + (max_order as usize + 1) * size_of::<u32>();
+    pub(super) fn from_bytes_recording(
+        data: &[u8],
+        facts: Option<&mut AllocatorParseRecorder>,
+    ) -> Self {
+        let layout = BuddyAllocatorEncodedLayout::ordinary(data);
+        #[cfg(not(redb_no_std))]
+        let value = Self::from_layout(layout, facts, None);
+        #[cfg(redb_no_std)]
+        let value = Self::from_layout(layout, facts);
+        value.expect("ordinary Buddy materialization has no fallible Source admission")
+    }
 
-        let mut free = vec![];
-        for _ in 0..=max_order {
-            let data_end = u32::from_le_bytes(
-                data[metadata..(metadata + size_of::<u32>())]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            free.push(BtreeBitmap::from_bytes(&data[data_start..data_end]));
-            data_start = data_end;
-            metadata += size_of::<u32>();
+    #[cfg(not(redb_no_std))]
+    pub(super) fn from_bytes_source(
+        data: &[u8],
+        resources: &super::page_resources::NativePageResources,
+    ) -> crate::Result<Self> {
+        Self::from_bytes_source_recording(data, resources, None)
+    }
+    #[cfg(not(redb_no_std))]
+    pub(super) fn from_bytes_source_recording(
+        data: &[u8],
+        resources: &super::page_resources::NativePageResources,
+        facts: Option<&mut AllocatorParseRecorder>,
+    ) -> crate::Result<Self> {
+        let layout = BuddyAllocatorEncodedLayout::inspect(data)
+            .map_err(|_| super::page_resources::refused())?;
+        let _ = layout
+            .source_capacity_bound()
+            .map_err(|_| super::page_resources::refused())?;
+        Self::from_layout(layout, facts, Some(resources))
+    }
+
+    fn from_layout(
+        layout: BuddyAllocatorEncodedLayout<'_>,
+        mut facts: Option<&mut AllocatorParseRecorder>,
+        #[cfg(not(redb_no_std))] resources: Option<&super::page_resources::NativePageResources>,
+    ) -> crate::Result<Self> {
+        #[cfg(not(redb_no_std))]
+        if resources.is_some() && !layout.checked {
+            return Err(super::page_resources::refused());
         }
-
-        Self {
+        #[cfg(not(redb_no_std))]
+        let mut free = if let Some(resources) = resources {
+            NativeOwnedAllocatorVec::source(layout.count(), resources)?
+        } else {
+            NativeOwnedAllocatorVec::default()
+        };
+        #[cfg(redb_no_std)]
+        let mut free = NativeOwnedAllocatorVec::default();
+        #[cfg(not(redb_no_std))]
+        if resources.is_some() {
+            if let Some(facts) = facts.as_deref_mut() {
+                facts.replace_vec::<BtreeBitmap>(0, free.capacity());
+            }
+        }
+        for order in layout.orders() {
+            let order = order.map_err(|_| super::page_resources::refused())?;
+            #[cfg(not(redb_no_std))]
+            let bitmap = BtreeBitmap::from_layout(order, facts.as_deref_mut(), resources)?;
+            #[cfg(redb_no_std)]
+            let bitmap = BtreeBitmap::from_layout(order, facts.as_deref_mut())?;
+            let old_capacity = free.capacity();
+            free.push(bitmap);
+            if let Some(facts) = facts.as_deref_mut() {
+                facts.replace_vec::<BtreeBitmap>(old_capacity, free.capacity());
+            }
+        }
+        Ok(Self {
             free,
-            len: num_pages,
-            max_order,
+            len: layout.num_pages,
+            max_order: layout.max_order,
+        })
+    }
+
+    pub(super) fn record_capacity(&self, facts: &mut AllocatorParseRecorder) {
+        facts.replace_vec::<BtreeBitmap>(0, self.free.capacity());
+        for bitmap in &self.free {
+            bitmap.record_capacity(facts);
         }
     }
 
@@ -320,7 +612,7 @@ impl BuddyAllocator {
                         let buddy = buddy_page(page);
                         if buddy < allocator.len() {
                             let buddy_allocated = allocator.get(buddy);
-                            assert!(buddy_allocated, "order={order} page={page} buddy={buddy}",);
+                            assert!(buddy_allocated, "order={order} page={page} buddy={buddy}");
                         }
                     }
                 }
@@ -558,5 +850,286 @@ mod test {
         let buddy_state_bytes = free_state_bytes + allocated_state_bytes + 21 * 2 * 4 + 8;
 
         assert!((allocator.to_vec().len() as u64) <= buddy_state_bytes);
+    }
+}
+
+#[cfg(all(test, not(redb_no_std)))]
+mod encoded_layout_source_tests {
+    use super::super::bitmap::U64GroupedBitmap;
+    use super::super::container_bounds;
+    use super::super::page_resources::NativePageResources;
+    use super::*;
+    use std::panic::catch_unwind;
+
+    fn genuine_bytes() -> Vec<u8> {
+        let mut original = BuddyAllocator::new(4097, 8192);
+        // Keep genuine allocated pages inside the later shrink boundary.
+        assert_eq!(original.alloc_lowest(0), Some(0));
+        assert_eq!(original.alloc_lowest(2), Some(1));
+        original.to_vec()
+    }
+    fn limit(bytes: u64) -> NativePageResources {
+        NativePageResources::from_retained_pool_data(usize::try_from(bytes).unwrap(), ()).unwrap()
+    }
+
+    #[test]
+    // req: STO-020, REC-001
+    fn native_nested_allocator_checked_layout_matches_genuine_materialization() {
+        let encoded = genuine_bytes();
+        let layout = BuddyAllocatorEncodedLayout::inspect(&encoded).unwrap();
+        assert_eq!(layout.consumed_end(), Some(encoded.len()));
+        let needed = layout.source_capacity_bound().unwrap();
+        let resources = limit(needed);
+        let mut facts = AllocatorParseRecorder::new();
+        let mut source =
+            BuddyAllocator::from_bytes_source_recording(&encoded, &resources, Some(&mut facts))
+                .unwrap();
+        let mut ordinary = BuddyAllocator::from_bytes(&encoded);
+        assert_eq!(source.free.capacity(), layout.count());
+        assert_eq!(source.to_vec(), encoded);
+        assert_eq!(
+            source.count_allocated_pages(),
+            ordinary.count_allocated_pages()
+        );
+        assert_eq!(source.alloc(1), ordinary.alloc(1));
+        assert_eq!(source.to_vec(), ordinary.to_vec());
+        assert_eq!(resources.current(), usize::try_from(needed).unwrap());
+        let observed = facts.finish().unwrap().retained();
+        assert!(observed.buffer_count() > layout.count());
+        assert!(observed.capacity_bytes() <= resources.current());
+        drop(source);
+        assert_eq!(resources.current(), 0);
+
+        let mut tree = BtreeBitmap::new_padded(8193, 8193, 1_048_576);
+        for bit in [0, 64, 8192] {
+            tree.clear(bit);
+        }
+        let encoded = tree.to_vec();
+        let layout = BtreeBitmapEncodedLayout::inspect(&encoded).unwrap();
+        let needed = layout.source_capacity_bound().unwrap();
+        let resources = limit(needed);
+        let source = BtreeBitmap::from_bytes_source(&encoded, &resources).unwrap();
+        assert_eq!(source.to_vec(), tree.to_vec());
+        for bit in [0, 64, 8192] {
+            assert!(!source.get(bit));
+        }
+        assert!(source.get(1));
+        assert_eq!(resources.current(), usize::try_from(needed).unwrap());
+        drop(source);
+        assert_eq!(resources.current(), 0);
+    }
+
+    #[test]
+    // req: STO-020, REC-001
+    fn native_nested_allocator_pre_resize_backing_stays_charged_until_drop() {
+        let encoded = genuine_bytes();
+        let needed = BuddyAllocatorEncodedLayout::inspect(&encoded)
+            .unwrap()
+            .source_capacity_bound()
+            .unwrap();
+        let resources = limit(needed);
+        let mut source = BuddyAllocator::from_bytes_source(&encoded, &resources).unwrap();
+        let mut ordinary = BuddyAllocator::from_bytes(&encoded);
+        source.resize(65);
+        ordinary.resize(65);
+        let smaller = source.to_vec();
+        assert_eq!(smaller, ordinary.to_vec());
+        assert_eq!(
+            source.count_allocated_pages(),
+            ordinary.count_allocated_pages()
+        );
+        assert!(smaller.len() < encoded.len());
+        let smaller_bound = BuddyAllocatorEncodedLayout::inspect(&smaller)
+            .unwrap()
+            .source_capacity_bound()
+            .unwrap();
+        assert!(smaller_bound < needed);
+        assert_eq!(resources.current(), usize::try_from(needed).unwrap());
+        drop(source);
+        assert_eq!(resources.current(), 0);
+    }
+
+    #[test]
+    // req: STO-020, REC-001
+    fn native_nested_allocator_checked_refusal_preserves_legacy_and_trailing_bytes() {
+        let encoded = genuine_bytes();
+        let mut malformed = Vec::new();
+        for end in 0..FREE_END_OFFSETS {
+            malformed.push(encoded[..end].to_vec());
+        }
+        malformed.push(encoded[..encoded.len() - 1].to_vec());
+        let mut backwards = encoded.clone();
+        backwards[FREE_END_OFFSETS..FREE_END_OFFSETS + size_of::<u32>()]
+            .copy_from_slice(&0u32.to_le_bytes());
+        malformed.push(backwards);
+        for bytes in malformed {
+            assert!(BuddyAllocatorEncodedLayout::inspect(&bytes).is_err());
+            let resources = limit(1_048_576);
+            let mut facts = AllocatorParseRecorder::new();
+            assert!(
+                BuddyAllocator::from_bytes_source_recording(&bytes, &resources, Some(&mut facts),)
+                    .is_err()
+            );
+            assert_eq!(resources.current(), 0);
+            assert_eq!(facts.finish().unwrap().retained().buffer_count(), 0);
+            assert!(catch_unwind(|| BuddyAllocator::from_bytes(&bytes)).is_err());
+        }
+        let mut trailing = encoded.clone();
+        trailing.extend_from_slice(&[17, 23, 99]);
+        let layout = BuddyAllocatorEncodedLayout::inspect(&trailing).unwrap();
+        assert_eq!(layout.consumed_end(), Some(encoded.len()));
+        let needed = layout.source_capacity_bound().unwrap();
+        assert_eq!(
+            needed,
+            BuddyAllocatorEncodedLayout::inspect(&encoded)
+                .unwrap()
+                .source_capacity_bound()
+                .unwrap()
+        );
+        let resources = limit(needed);
+        let source = BuddyAllocator::from_bytes_source(&trailing, &resources).unwrap();
+        assert_eq!(source.to_vec(), encoded);
+        assert_eq!(BuddyAllocator::from_bytes(&trailing).to_vec(), encoded);
+        drop(source);
+        assert_eq!(resources.current(), 0);
+
+        let encoded = BtreeBitmap::new_padded(4097, 4097, 8192).to_vec();
+        let mut trailing = encoded.clone();
+        trailing.extend_from_slice(&[5, 8, 13]);
+        let layout = BtreeBitmapEncodedLayout::inspect(&trailing).unwrap();
+        assert_eq!(layout.consumed_end(), Some(encoded.len()));
+        let resources = limit(layout.source_capacity_bound().unwrap());
+        let source = BtreeBitmap::from_bytes_source(&trailing, &resources).unwrap();
+        assert_eq!(source.to_vec(), encoded);
+        assert_eq!(BtreeBitmap::from_bytes(&trailing).to_vec(), encoded);
+        drop(source);
+        assert_eq!(resources.current(), 0);
+    }
+
+    #[test]
+    // req: STO-020, REC-001
+    fn native_nested_allocator_n_minus_one_and_mid_child_failure_refund() {
+        let encoded = genuine_bytes();
+        let layout = BuddyAllocatorEncodedLayout::inspect(&encoded).unwrap();
+        let needed = layout.source_capacity_bound().unwrap();
+        let resources = limit(needed.checked_sub(1).unwrap());
+        // External complete-quote admission is separate from the per-vector
+        // constructor. Its refusal cannot allocate any child backing.
+        assert!(
+            resources
+                .admit_control(usize::try_from(needed).unwrap())
+                .is_err()
+        );
+        assert_eq!(resources.current(), 0);
+        let mut facts = AllocatorParseRecorder::new();
+        assert!(
+            BuddyAllocator::from_bytes_source_recording(&encoded, &resources, Some(&mut facts),)
+                .is_err()
+        );
+        assert!(facts.finish().unwrap().retained().buffer_count() > 0);
+        assert_eq!(resources.current(), 0);
+
+        let mut orders = layout.orders();
+        let first = orders.next().unwrap().unwrap();
+        let second = orders.next().unwrap().unwrap();
+        assert!(first.count() > 0 && second.count() > 0);
+        let outer = container_bounds::vector_storage::<BtreeBitmap>(layout.count())
+            .unwrap()
+            .allocator_bytes;
+        let first_bytes = first.source_capacity_bound().unwrap();
+        let second_outer = container_bounds::vector_storage::<U64GroupedBitmap>(second.count())
+            .unwrap()
+            .allocator_bytes;
+        let partial_limit = outer
+            .checked_add(first_bytes)
+            .unwrap()
+            .checked_add(second_outer)
+            .unwrap()
+            .checked_sub(1)
+            .unwrap();
+        assert!(partial_limit < needed);
+        let resources = limit(partial_limit);
+        let mut facts = AllocatorParseRecorder::new();
+        assert!(
+            BuddyAllocator::from_bytes_source_recording(&encoded, &resources, Some(&mut facts),)
+                .is_err()
+        );
+        // First child was fully materialized and moved into the outer owner;
+        // the next child's outer backing was refused before construction.
+        assert_eq!(
+            facts.finish().unwrap().retained().buffer_count(),
+            first.count() + 2
+        );
+        assert_eq!(resources.current(), 0);
+    }
+
+    #[test]
+    // req: STO-020, REC-001
+    fn native_borrowed_buddy_resize_quote_covers_actual_guarded_preparation() {
+        let encoded = genuine_bytes();
+        let layout = BuddyAllocatorEncodedLayout::inspect(&encoded).unwrap();
+        for target in [65, 4097, 8192] {
+            let parsed = layout.source_capacity_bound().unwrap();
+            let resized = layout.source_resize_capacity_bound(target).unwrap();
+            let complete_peak = parsed.max(resized.simultaneous_peak_bytes);
+            let resources = limit(complete_peak);
+            assert_eq!(resources.current(), 0);
+            let mut source = BuddyAllocator::from_bytes_source(&encoded, &resources).unwrap();
+            if target > source.len() {
+                source.prepare_source_resize(target, &resources).unwrap();
+            }
+            source.resize(target);
+            let mut ordinary = BuddyAllocator::from_bytes(&encoded);
+            ordinary.resize(target);
+            assert_eq!(source.to_vec(), ordinary.to_vec());
+            assert_eq!(
+                source.count_allocated_pages(),
+                ordinary.count_allocated_pages()
+            );
+            assert!(resources.current() as u64 <= resized.retained_after_bytes);
+            assert!(resources.admitted_high_water_for_test() as u64 <= complete_peak);
+            drop(source);
+            assert_eq!(resources.current(), 0);
+        }
+    }
+
+    #[test]
+    // req: STO-020, REC-001
+    fn native_borrowed_resize_complete_quote_refuses_n_minus_one_before_materialization() {
+        let encoded = genuine_bytes();
+        let layout = BuddyAllocatorEncodedLayout::inspect(&encoded).unwrap();
+        let parsed = layout.source_capacity_bound().unwrap();
+        let resized = layout.source_resize_capacity_bound(8192).unwrap();
+        let peak = parsed.max(resized.simultaneous_peak_bytes);
+        assert!(
+            peak > parsed,
+            "real guarded growth requires more than the parser-only allowance"
+        );
+        let resources = limit(peak.checked_sub(1).unwrap());
+        // Actual native numerical admission, not a numeric comparison or a
+        // Source authority. The conservative upper is not an internal exact
+        // minimum: this test does not require construction at peak-1 to fail.
+        assert!(
+            resources
+                .admit_control(usize::try_from(peak).unwrap())
+                .is_err()
+        );
+        assert_eq!(resources.current(), 0);
+        assert_eq!(resources.admitted_high_water_for_test(), 0);
+        let resources = limit(peak);
+        let preflight = resources
+            .admit_control(usize::try_from(peak).unwrap())
+            .unwrap();
+        assert_eq!(resources.current(), usize::try_from(peak).unwrap());
+        drop(preflight);
+        assert_eq!(resources.current(), 0);
+        let mut source = BuddyAllocator::from_bytes_source(&encoded, &resources).unwrap();
+        source.prepare_source_resize(8192, &resources).unwrap();
+        source.resize(8192);
+        let mut ordinary = BuddyAllocator::from_bytes(&encoded);
+        ordinary.resize(8192);
+        assert_eq!(source.to_vec(), ordinary.to_vec());
+        drop(source);
+        assert_eq!(resources.current(), 0);
     }
 }

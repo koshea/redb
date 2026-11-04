@@ -1,6 +1,11 @@
 #![cfg_attr(redb_no_std, no_std)]
 #![deny(clippy::all, clippy::pedantic, clippy::disallowed_methods)]
 #![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    unused_mut,
+    unused_parens,
     clippy::if_not_else,
     clippy::iter_not_returning_iterator,
     clippy::missing_errors_doc,
@@ -72,12 +77,17 @@ extern crate alloc;
 
 #[cfg(feature = "experimental-multiprocess")]
 pub use db::ConcurrencyMode;
-#[cfg(not(redb_no_std))]
-pub use db::ReadOnlyDatabase;
 pub use db::{
     Builder, CacheStats, Database, MultimapTableDefinition, MultimapTableHandle, ReadableDatabase,
     RepairSession, StorageBackend, TableDefinition, TableHandle, UntypedMultimapTableHandle,
     UntypedTableHandle,
+};
+#[cfg(not(redb_no_std))]
+pub use db::{
+    PlannedByteRange, PlannedBytesTable, PlannedKeyValue, PlannedReadOnlyDatabase,
+    PlannedReadTransaction, PlannedStrTable, PlannedValue, ReadOnlyDatabase,
+    ReadOnlyPostHandoffCustody, ReadOnlyReopenError, ReadOnlyReopenHandoff,
+    ReadOnlyReopenResourcePlan,
 };
 pub use error::{
     BackendError, CommitError, CompactionError, CursorError, DatabaseError, Error, SavepointError,
@@ -162,3 +172,15 @@ fn create_tempfile() -> tempfile::NamedTempFile {
         tempfile::NamedTempFile::new().unwrap()
     }
 }
+
+#[cfg(not(redb_no_std))]
+pub use transactions::NativeReadContextPlan;
+
+#[cfg(not(redb_no_std))]
+pub use db::NativeCurrentReadPlan;
+
+#[cfg(not(redb_no_std))]
+mod native_numerical_pool;
+#[cfg(not(redb_no_std))]
+#[doc(hidden)]
+pub use native_numerical_pool::{NativeNumericalPool, NativeNumericalPoolError};

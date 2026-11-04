@@ -1,5 +1,23 @@
+use super::fixed_scratch::ScratchVec;
+#[cfg(not(redb_no_std))]
+#[path = "owned_cursor_source.rs"]
+mod owned_cursor_source;
+#[cfg(not(redb_no_std))]
+pub(crate) use owned_cursor_source::NativeFixedCursorPool;
+#[derive(Clone, Copy)]
+pub(crate) enum FixedCursorKey {
+    Lower,
+    Upper,
+    Seek,
+    Scan,
+    Park,
+}
 use crate::AccessGuard;
 use crate::sync::Mutex;
+use crate::tree_store::NativeLocalPageVec;
+use crate::tree_store::NativeOwnedPageVec;
+use crate::tree_store::NativeOwnedShared;
+use crate::tree_store::SharedPageBytes;
 use crate::tree_store::btree_base::{
     BRANCH, BranchAccessor, LEAF, LeafAccessor, MAX_BTREE_DEPTH, OwnedEntryBuffer,
     leaf_below_merge_threshold, leaf_fits_one_page, retained_after_removals,
@@ -22,9 +40,22 @@ use core::ops::Bound::{Excluded, Included, Unbounded};
 use core::ops::Range;
 
 #[derive(Clone)]
-struct Branch {
+pub(super) struct Branch {
     page: PageImpl,
     child_index: usize,
+}
+
+pub(crate) fn readonly_cursor_capacity_bytes()
+-> core::result::Result<u64, super::page_store::allocator_reopen_facts::AllocatorResourceError> {
+    use super::page_store::ReadOnlyResourceProfile as P;
+    use core::mem::{align_of, size_of};
+    // One forward cursor. The previous allocation can coexist during growth.
+    P::allocation(MAX_BTREE_DEPTH * size_of::<Branch>(), align_of::<Branch>())?
+        .checked_add(P::allocation(
+            (MAX_BTREE_DEPTH / 2) * size_of::<Branch>(),
+            align_of::<Branch>(),
+        )?)
+        .ok_or(super::page_store::allocator_reopen_facts::AllocatorResourceError::Overflow)
 }
 
 impl Branch {
@@ -132,17 +163,59 @@ fn child_to_visit<K: Key>(
     }
 }
 
+// The readonly cursor retains its ordinary Vec. Checked mutable cursors use
+// their already-prepared storage; every push checks capacity before mutation.
+trait CursorPath {
+    fn values(&self) -> &[Branch];
+    fn values_mut(&mut self) -> &mut [Branch];
+    fn truncate(&mut self, length: usize);
+    fn push(&mut self, value: Branch) -> Result<()>;
+}
+impl CursorPath for Vec<Branch> {
+    fn values(&self) -> &[Branch] {
+        self
+    }
+    fn values_mut(&mut self) -> &mut [Branch] {
+        self
+    }
+    fn truncate(&mut self, length: usize) {
+        Vec::truncate(self, length);
+    }
+    fn push(&mut self, value: Branch) -> Result<()> {
+        Vec::push(self, value);
+        Ok(())
+    }
+}
+impl CursorPath for ScratchVec<Branch> {
+    fn values(&self) -> &[Branch] {
+        self.as_slice()
+    }
+    fn values_mut(&mut self) -> &mut [Branch] {
+        self.as_mut_slice()
+    }
+    fn truncate(&mut self, length: usize) {
+        ScratchVec::truncate(self, length);
+    }
+    fn push(&mut self, value: Branch) -> Result<()> {
+        self.try_push(value)
+    }
+}
+
 fn descend_to_position<K: Key + 'static, V: Value + 'static, F>(
     page: PageImpl,
     position: Position<'_>,
-    path: &mut Vec<Branch>,
+    path: &mut impl CursorPath,
     get_page: &mut F,
 ) -> Result<Leaf>
 where
     F: FnMut(PageNumber) -> Result<PageImpl>,
 {
+    if let Position::Before(query) | Position::After(query) = position {
+        super::btree::resource_key_paths::check_btree_key::<K>(query)?;
+    }
     let mut page = page;
     loop {
+        super::btree::resource_key_paths::check_btree_node::<K, V>(&page)?;
         let (child_index, child_page) = match page.memory()[0] {
             LEAF => {
                 let (leaf_position, len) = {
@@ -166,29 +239,29 @@ where
             }
             _ => unreachable!(),
         };
-        if path.len() >= MAX_BTREE_DEPTH {
+        if path.values().len() >= MAX_BTREE_DEPTH {
             return Err(StorageError::Corrupted(
                 "Btree exceeded maximum depth".to_string(),
             ));
         }
-        path.push(Branch::new(page, child_index));
+        path.push(Branch::new(page, child_index))?;
         page = get_page(child_page)?;
     }
 }
 
 fn move_to_adjacent_leaf<K: Key + 'static, V: Value + 'static, F>(
-    path: &mut Vec<Branch>,
+    path: &mut impl CursorPath,
     direction: Direction,
     get_page: &mut F,
 ) -> Result<Option<Leaf>>
 where
     F: FnMut(PageNumber) -> Result<PageImpl>,
 {
-    for index in (0..path.len()).rev() {
+    for index in (0..path.values().len()).rev() {
         if let Some((child_index, child_page)) =
-            path[index].adjacent_child(direction, K::fixed_width())
+            path.values()[index].adjacent_child(direction, K::fixed_width())
         {
-            path[index].child_index = child_index;
+            path.values_mut()[index].child_index = child_index;
             path.truncate(index + 1);
             let page = get_page(child_page)?;
             let edge = if direction.is_next() {
@@ -205,7 +278,7 @@ where
 
 fn prepare_leaf<K: Key + 'static, V: Value + 'static, F>(
     leaf: &mut Option<Leaf>,
-    path: &mut Vec<Branch>,
+    path: &mut impl CursorPath,
     direction: Direction,
     get_page: &mut F,
 ) -> Result<bool>
@@ -271,6 +344,30 @@ fn scan_boundary_key<K: Key + 'static, V: Value + 'static>(
     }
 }
 
+fn cursor_key_data<K: Key + 'static, V: Value + 'static>(
+    allocator: &PageAllocator,
+    leaf: &Leaf,
+    position: usize,
+    role: FixedCursorKey,
+) -> Result<ScratchVec<u8>> {
+    let accessor = LeafAccessor::new(leaf.page.memory(), K::fixed_width(), V::fixed_width());
+    allocator.copy_cursor_key(
+        role,
+        accessor.entry(position).expect("existing cursor key").key(),
+    )
+}
+fn cursor_scan_boundary<K: Key + 'static, V: Value + 'static>(
+    allocator: &PageAllocator,
+    leaf: &Leaf,
+    direction: Direction,
+) -> Result<ScratchVec<u8>> {
+    let index = match direction {
+        Direction::Next => leaf.len - 1,
+        Direction::Previous => 0,
+    };
+    cursor_key_data::<K, V>(allocator, leaf, index, FixedCursorKey::Scan)
+}
+
 #[derive(Clone)]
 struct Leaf {
     page: PageImpl,
@@ -303,7 +400,12 @@ struct LeafRunRewrite {
 }
 
 impl LeafRunRewrite {
-    fn new(parent_page: PageNumber, child_index: usize, direction: Direction) -> Self {
+    fn new(
+        parent_page: PageNumber,
+        child_index: usize,
+        direction: Direction,
+        entries: OwnedEntryBuffer,
+    ) -> Self {
         let origin = match direction {
             Direction::Next => child_index,
             Direction::Previous => child_index + 1,
@@ -313,7 +415,7 @@ impl LeafRunRewrite {
             parent_page,
             direction,
             replaced_children,
-            entries: OwnedEntryBuffer::default(),
+            entries,
             removed_pairs: 0,
         }
     }
@@ -323,7 +425,7 @@ impl LeafRunRewrite {
         page: PageImpl,
         child_index: usize,
         removed_indexes: &[usize],
-    ) {
+    ) -> Result<()> {
         debug_assert!(removed_indexes.windows(2).all(|pair| pair[0] < pair[1]));
         // Hard asserts: a violation would splice the wrong children out of
         // the parent, so it must not be compiled out of release builds.
@@ -343,7 +445,8 @@ impl LeafRunRewrite {
         // backward scan's entirely smaller.
         let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
         self.entries
-            .extend_from_leaf(&accessor, removed_indexes, self.direction.is_next());
+            .extend_from_leaf(&accessor, removed_indexes, self.direction.is_next())?;
+        Ok(())
     }
 }
 
@@ -651,7 +754,7 @@ impl<K: Key + 'static, V: Value + 'static> Cursor<K, V> {
 }
 
 struct CursorPosition {
-    path: Vec<Branch>,
+    path: ScratchVec<Branch>,
     // Gap cursor position: next operations use `position`, and previous
     // operations use the entry before `position`.
     leaf: Leaf,
@@ -661,13 +764,15 @@ struct CursorPosition {
 // `RangeMut` can persist a cursor position across calls.
 #[derive(Default)]
 pub(super) struct CursorState {
+    // Actual checked Source packing storage, checked out before descent.
+    reserved_entries: Option<OwnedEntryBuffer>,
     // None means the cursor has not been positioned. Otherwise the ancestor
     // path and current leaf are kept together as one valid gap cursor.
     position: Option<CursorPosition>,
     // Pending removals from the current leaf. A batch is recorded in strictly
     // increasing order by forward scans, or strictly decreasing order by
     // backward scans; the two must not be mixed within a batch.
-    removed_indexes: Vec<usize>,
+    removed_indexes: ScratchVec<usize>,
     // True when guards backed by the current leaf's memory were handed out for
     // pending removals: the flush must not modify the leaf memory in place.
     detached_guards: bool,
@@ -691,7 +796,7 @@ enum LeafCloseOutcome {
     Unchanged,
     // The tree was rewritten and the cursor position consumed; resume the
     // scan from `resume_key`.
-    Flushed { resume_key: Vec<u8> },
+    Flushed { resume_key: ScratchVec<u8> },
     // The leaf was absorbed into the open run, whose parent has more children
     // to consume. The tree is untouched, so the cursor position (still on the
     // absorbed leaf) remains valid.
@@ -702,8 +807,8 @@ pub(super) struct CursorMut<'a, 'b, K: Key + 'static, V: Value + 'static> {
     // Table header state, separate from traversal position.
     root: &'b mut Option<BtreeHeader>,
     page_allocator: &'b PageAllocator,
-    freed: &'b mut Vec<PageNumber>,
-    allocated: &'b Arc<PageTracker>,
+    freed: &'b mut NativeOwnedPageVec,
+    allocated: &'b NativeOwnedShared<PageTracker>,
     state: CursorState,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
@@ -711,11 +816,27 @@ pub(super) struct CursorMut<'a, 'b, K: Key + 'static, V: Value + 'static> {
 }
 
 impl CursorPosition {
-    fn into_parts(self) -> (Vec<(PageImpl, usize)>, Leaf) {
-        (
-            self.path.into_iter().map(Branch::into_parts).collect(),
-            self.leaf,
-        )
+    fn into_parts(
+        self,
+        allocator: &PageAllocator,
+    ) -> Result<(ScratchVec<(PageImpl, usize)>, Leaf)> {
+        let Self { mut path, leaf } = self;
+        if !path.is_prepared() {
+            return Ok((
+                ScratchVec::ordinary(
+                    path.into_ordinary()?
+                        .into_iter()
+                        .map(Branch::into_parts)
+                        .collect(),
+                ),
+                leaf,
+            ));
+        }
+        let mut parts = allocator.prepare_cursor_parts()?;
+        for frame in path.drain(..) {
+            parts.try_push(frame.into_parts())?;
+        }
+        Ok((parts, leaf))
     }
 
     fn has_entry(&self, direction: Direction) -> bool {
@@ -744,8 +865,8 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
     pub(super) fn new(
         root: &'b mut Option<BtreeHeader>,
         page_allocator: &'b PageAllocator,
-        freed: &'b mut Vec<PageNumber>,
-        allocated: &'b Arc<PageTracker>,
+        freed: &'b mut NativeOwnedPageVec,
+        allocated: &'b NativeOwnedShared<PageTracker>,
     ) -> Self {
         Self::with_state(
             root,
@@ -759,8 +880,8 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
     pub(super) fn with_state(
         root: &'b mut Option<BtreeHeader>,
         page_allocator: &'b PageAllocator,
-        freed: &'b mut Vec<PageNumber>,
-        allocated: &'b Arc<PageTracker>,
+        freed: &'b mut NativeOwnedPageVec,
+        allocated: &'b NativeOwnedShared<PageTracker>,
         state: CursorState,
     ) -> Self {
         Self {
@@ -791,7 +912,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
         let root_page = self.page_allocator.get_page(header.root, PageHint::None)?;
         let page_allocator = self.page_allocator;
         let mut get_page = |page| page_allocator.get_page(page, PageHint::None);
-        let mut path = vec![];
+        let mut path = self.page_allocator.prepare_cursor_path()?;
         let leaf = descend_to_position::<K, V, _>(root_page, target, &mut path, &mut get_page)?;
         self.state.position = Some(CursorPosition { path, leaf });
         Ok(())
@@ -1019,7 +1140,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
         if !self.ensure_has_entry(Direction::Next)? {
             return Ok(false);
         }
-        self.record_removal(Direction::Next);
+        self.record_removal(Direction::Next)?;
         Ok(true)
     }
 
@@ -1034,7 +1155,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
         if !self.ensure_has_entry(Direction::Next)? {
             return Ok(None);
         }
-        Ok(Some(self.record_removal_deferred(Direction::Next)))
+        Ok(Some(self.record_removal_deferred(Direction::Next)?))
     }
 
     /// Removes and returns the previous entry.
@@ -1067,7 +1188,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
         if !self.ensure_has_entry(Direction::Previous)? {
             return Ok(None);
         }
-        Ok(Some(self.record_removal_deferred(Direction::Previous)))
+        Ok(Some(self.record_removal_deferred(Direction::Previous)?))
     }
 
     /// Removes the entry after the gap, returning it with a copy of its key.
@@ -1097,6 +1218,9 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
         &mut self,
         direction: Direction,
     ) -> Result<Option<(Vec<u8>, AccessGuard<'a, K>, AccessGuard<'a, V>)>> {
+        if self.page_allocator.is_checked_source() {
+            return Err(StorageError::PreviousIo);
+        }
         assert!(self.state.removed_indexes.is_empty());
         if !self.ensure_has_entry(direction)? {
             return Ok(None);
@@ -1112,7 +1236,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
         Ok(entry.map(|(key_guard, value_guard)| (key, key_guard, value_guard)))
     }
 
-    fn record_removal(&mut self, direction: Direction) -> usize {
+    fn record_removal(&mut self, direction: Direction) -> Result<usize> {
         let position = self
             .state
             .position
@@ -1135,21 +1259,21 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
             monotonic,
             "removed indexes must be recorded monotonically in the scan direction"
         );
-        self.state.removed_indexes.push(index);
+        self.state.removed_indexes.try_push(index)?;
         position.move_once(direction);
-        index
+        Ok(index)
     }
 
     fn record_removal_deferred(
         &mut self,
         direction: Direction,
-    ) -> (AccessGuard<'a, K>, AccessGuard<'a, V>) {
+    ) -> Result<(AccessGuard<'a, K>, AccessGuard<'a, V>)> {
         // The Arc-backed guards stay valid because the page store hands out a
         // fresh buffer whenever a freed page number is reused, and no flush
         // that can run while these guards exist mutates leaf bytes in place:
         // the detached flush below and `RangeMut`'s batch resolution by key
         // both rewrite leaves instead.
-        let index = self.record_removal(direction);
+        let index = self.record_removal(direction)?;
         self.state.detached_guards = true;
         let leaf = &self
             .state
@@ -1162,10 +1286,10 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
                 .entry_ranges(index)
                 .expect("removed cursor entry must exist");
         let page = leaf.page.to_arc();
-        (
+        Ok((
             AccessGuard::with_arc_page(page.clone(), key_range),
             AccessGuard::with_arc_page(page, value_range),
-        )
+        ))
     }
 
     pub(super) fn finish_pending_removals(&mut self) -> Result {
@@ -1213,7 +1337,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
 
     // Applies the pending removals, returning the key past which the scan
     // resumes.
-    fn flush_removed_entries(&mut self, direction: Direction) -> Result<Vec<u8>> {
+    fn flush_removed_entries(&mut self, direction: Direction) -> Result<ScratchVec<u8>> {
         assert!(!self.state.removed_indexes.is_empty());
 
         let position = self
@@ -1224,8 +1348,9 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
         // Tree mutation invalidates the cursor path. Callers that continue
         // iteration reseek to the first entry past the original leaf in the
         // scan direction.
-        let resume_key = scan_boundary_key::<K, V>(&position.leaf, direction);
-        let (path, leaf) = position.into_parts();
+        let resume_key =
+            cursor_scan_boundary::<K, V>(self.page_allocator, &position.leaf, direction)?;
+        let (path, leaf) = position.into_parts(self.page_allocator)?;
         let allow_in_place = !self.state.detached_guards;
         let removed_indexes = self.take_removals_ascending();
         let result = self.mutate_helper().delete_leaf_entries(
@@ -1309,7 +1434,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
             }
             let keeps_run_open = packs && self.run_parent_has_more_children(direction);
             let removed_indexes = self.take_removals_ascending();
-            self.append_leaf_to_run(direction, &removed_indexes);
+            self.append_leaf_to_run(direction, &removed_indexes)?;
             if keeps_run_open {
                 return Ok(LeafCloseOutcome::AbsorbedIntoRun);
             }
@@ -1319,14 +1444,15 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
         // Every remaining path ends the run: splice it and resume past this
         // leaf, whose furthest key bounds everything the run consumed.
         let position = self.state.position.as_ref().unwrap();
-        let resume_key = scan_boundary_key::<K, V>(&position.leaf, direction);
+        let resume_key =
+            cursor_scan_boundary::<K, V>(self.page_allocator, &position.leaf, direction)?;
         self.splice_open_run()?;
         Ok(LeafCloseOutcome::Flushed { resume_key })
     }
 
     // Takes the pending batch in ascending order; backward scans record their
     // batch in decreasing order.
-    fn take_removals_ascending(&mut self) -> Vec<usize> {
+    fn take_removals_ascending(&mut self) -> ScratchVec<usize> {
         let mut removed_indexes = core::mem::take(&mut self.state.removed_indexes);
         if removed_indexes.first() > removed_indexes.last() {
             removed_indexes.reverse();
@@ -1345,7 +1471,11 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
 
     // Absorbs the current leaf into the run, opening one if necessary. The
     // tree and the cursor position are left untouched.
-    fn append_leaf_to_run(&mut self, direction: Direction, removed_indexes: &[usize]) {
+    fn append_leaf_to_run(
+        &mut self,
+        direction: Direction,
+        removed_indexes: &[usize],
+    ) -> Result<()> {
         let (page, parent_page, child_index) = {
             let frame = self.run_parent_frame();
             let position = self.state.position.as_ref().unwrap();
@@ -1355,15 +1485,32 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
                 frame.child_index,
             )
         };
+        if self.state.leaf_run_rewrite.is_none() {
+            let entries = match self.state.reserved_entries.take() {
+                Some(prepared) => prepared,
+                None => self
+                    .page_allocator
+                    .prepare_sparse_entries()?
+                    .unwrap_or_default(),
+            };
+            self.state.leaf_run_rewrite = Some(LeafRunRewrite::new(
+                parent_page,
+                child_index,
+                direction,
+                entries,
+            ));
+        }
         let run = self
             .state
             .leaf_run_rewrite
-            .get_or_insert_with(|| LeafRunRewrite::new(parent_page, child_index, direction));
+            .as_mut()
+            .expect("installed leaf run");
         // Hard asserts: a stale parent or mixed scan direction would splice
         // the wrong children, so they must hold in release builds too.
         assert_eq!(run.parent_page, parent_page);
         assert!(run.direction == direction);
-        run.append_entries_from::<K, V>(page, child_index, removed_indexes);
+        run.append_entries_from::<K, V>(page, child_index, removed_indexes)?;
+        Ok(())
     }
 
     // Replaces the run's children in the parent with packed leaves built from
@@ -1401,8 +1548,23 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
                 .get_page_number(),
             run.parent_page
         );
+        let mut path = path;
+        let path = if path.is_prepared() {
+            let mut parts = self.page_allocator.prepare_cursor_parts()?;
+            for frame in path.drain(..) {
+                parts.try_push(frame.into_parts())?;
+            }
+            parts
+        } else {
+            ScratchVec::ordinary(
+                path.into_ordinary()?
+                    .into_iter()
+                    .map(Branch::into_parts)
+                    .collect(),
+            )
+        };
         self.mutate_helper().replace_leaf_children(
-            path.into_iter().map(Branch::into_parts).collect(),
+            path,
             run.replaced_children,
             run.entries,
             run.removed_pairs,
@@ -1426,11 +1588,24 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
     fn remove_leaf_entry(
         &mut self,
         leaf: PageImpl,
-        path: Vec<Branch>,
+        mut path: ScratchVec<Branch>,
         index: usize,
     ) -> Result<Option<(AccessGuard<'a, K>, AccessGuard<'a, V>)>> {
         assert!(self.state.removed_indexes.is_empty());
-        let path = path.into_iter().map(Branch::into_parts).collect();
+        let path = if path.is_prepared() {
+            let mut parts = self.page_allocator.prepare_cursor_parts()?;
+            for frame in path.drain(..) {
+                parts.try_push(frame.into_parts())?;
+            }
+            parts
+        } else {
+            ScratchVec::ordinary(
+                path.into_ordinary()?
+                    .into_iter()
+                    .map(Branch::into_parts)
+                    .collect(),
+            )
+        };
         let entry = self.mutate_helper().pop_leaf_entry(leaf, path, index)?;
         Ok(Some(entry))
     }
@@ -1456,7 +1631,7 @@ impl<K: Key + 'static, V: Value + 'static> CursorMut<'_, '_, K, V> {
             }
             return Ok(false);
         }
-        run.entries.push_back(key, value);
+        run.entries.push_back(key, value)?;
         run.previous_key = Some(key.to_vec());
         run.inserted_pairs += 1;
         if run.entries.total_bytes() >= INSERT_FLUSH_BYTES {
@@ -1484,7 +1659,7 @@ impl<K: Key + 'static, V: Value + 'static> CursorMut<'_, '_, K, V> {
             }
             return Ok(false);
         }
-        run.entries.push_front(key, value);
+        run.entries.push_front(key, value)?;
         run.inserted_pairs += 1;
         if run.entries.total_bytes() >= INSERT_FLUSH_BYTES {
             self.flush_insert_run(true)?;
@@ -1515,6 +1690,9 @@ impl<K: Key + 'static, V: Value + 'static> CursorMut<'_, '_, K, V> {
     // and its successors are `position..` of the current leaf plus every
     // later leaf.
     fn open_insert_run(&mut self, direction: RunDirection) -> Result {
+        if self.page_allocator.is_checked_source() {
+            return Err(StorageError::PreviousIo);
+        }
         assert!(self.state.insert_run.is_none());
         let opening_next_key = self.peek_next()?.map(|entry| entry.key_bytes().to_vec());
         let previous_key = self.peek_prev()?.map(|entry| entry.key_bytes().to_vec());
@@ -1529,7 +1707,7 @@ impl<K: Key + 'static, V: Value + 'static> CursorMut<'_, '_, K, V> {
                 K::fixed_width(),
                 V::fixed_width(),
             );
-            entries.extend_from_leaf_range(&accessor, 0..position.leaf.position, true);
+            entries.extend_from_leaf_range(&accessor, 0..position.leaf.position, true)?;
         }
         self.state.insert_run = Some(Box::new(InsertRun {
             direction,
@@ -1573,20 +1751,23 @@ impl<K: Key + 'static, V: Value + 'static> CursorMut<'_, '_, K, V> {
             // leaf's entries before the gap join at the front here. The rest
             // of the leaf follows every pending insert either way.
             if descending {
-                entries.extend_from_leaf_range(&accessor, 0..position.leaf.position, false);
+                entries.extend_from_leaf_range(&accessor, 0..position.leaf.position, false)?;
             }
             entries.extend_from_leaf_range(
                 &accessor,
                 position.leaf.position..position.leaf.len,
                 true,
-            );
+            )?;
             let CursorPosition { path, leaf } = position;
             let replaced_leaf = leaf.page.get_page_number();
             // The leaf is one of the pages the splice frees, so its page
             // reference must be released first.
             drop(leaf);
             Some((
-                path.into_iter().map(Branch::into_parts).collect(),
+                path.into_ordinary()?
+                    .into_iter()
+                    .map(Branch::into_parts)
+                    .collect(),
                 replaced_leaf,
             ))
         } else {
@@ -1619,9 +1800,9 @@ impl<K: Key + 'static, V: Value + 'static> CursorMut<'_, '_, K, V> {
 pub(super) struct CursorTree<'a, K: Key + 'static, V: Value + 'static> {
     root: &'a mut Option<BtreeHeader>,
     page_allocator: PageAllocator,
-    allocated: Arc<PageTracker>,
-    master_free_list: Arc<Mutex<Vec<PageNumber>>>,
-    freed: Vec<PageNumber>,
+    allocated: NativeOwnedShared<PageTracker>,
+    master_free_list: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+    freed: NativeLocalPageVec,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
 }
@@ -1630,18 +1811,24 @@ impl<'a, K: Key + 'static, V: Value + 'static> CursorTree<'a, K, V> {
     fn new(
         root: &'a mut Option<BtreeHeader>,
         page_allocator: PageAllocator,
-        master_free_list: Arc<Mutex<Vec<PageNumber>>>,
-        allocated: Arc<PageTracker>,
+        master_free_list: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+        allocated: NativeOwnedShared<PageTracker>,
     ) -> Self {
         Self {
             root,
             page_allocator,
             allocated,
             master_free_list,
-            freed: vec![],
+            freed: NativeLocalPageVec::default(),
             _key_type: PhantomData,
             _value_type: PhantomData,
         }
+    }
+
+    fn prepare_local_freed(&mut self) -> Result<()> {
+        let original = self.master_free_list.lock()?;
+        self.page_allocator
+            .prepare_local_freed(&original, &mut self.freed)
     }
 
     fn cursor(&mut self, state: CursorState) -> CursorMut<'a, '_, K, V> {
@@ -1774,8 +1961,8 @@ impl<'a, K: Key + 'static, V: Value + 'static> BtreeCursorMut<'a, K, V> {
     pub(crate) fn new(
         root: &'a mut Option<BtreeHeader>,
         page_allocator: PageAllocator,
-        master_free_list: Arc<Mutex<Vec<PageNumber>>>,
-        allocated: Arc<PageTracker>,
+        master_free_list: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+        allocated: NativeOwnedShared<PageTracker>,
     ) -> Self {
         Self {
             tree: CursorTree::new(root, page_allocator, master_free_list, allocated),
@@ -1969,6 +2156,8 @@ impl<'a, K: Key + 'static, V: Value + 'static> BtreeCursorMut<'a, K, V> {
         &mut self,
         operation: impl FnOnce(&mut CursorMut<'a, '_, K, V>) -> Result<R>,
     ) -> Result<R> {
+        // Preserve pending state on admission failure: prepare before taking it.
+        self.tree.prepare_local_freed()?;
         let mut cursor = self.tree.cursor(core::mem::take(&mut self.state));
         let result = operation(&mut cursor);
         self.state = cursor.into_state();
@@ -1989,7 +2178,7 @@ impl<'a, K: Key + 'static, V: Value + 'static> BtreeCursorMut<'a, K, V> {
 // the end is next activated, so alternating between the ends keeps the
 // per-leaf removal batching.
 enum EndState {
-    Parked(Bound<Vec<u8>>),
+    Parked(Bound<ScratchVec<u8>>),
     Pending(ParkedBatch),
     Live(CursorState),
 }
@@ -2000,9 +2189,9 @@ enum EndState {
 // mutations that can run while the batch exists must not modify leaf memory
 // in place.
 struct ParkedBatch {
-    bound: Bound<Vec<u8>>,
-    leaf_bytes: Arc<[u8]>,
-    removed_indexes: Vec<usize>,
+    bound: Bound<ScratchVec<u8>>,
+    leaf_bytes: SharedPageBytes,
+    removed_indexes: ScratchVec<usize>,
 }
 
 // A pair of mutable gap cursors converging over a key range, the engine
@@ -2022,23 +2211,28 @@ pub(super) struct RangeMut<'a, K: Key + 'static, V: Value + 'static> {
     // caller: they may remain in the tree, so the transaction must not
     // commit. Every range operation re-raises instead of touching the tree.
     poisoned: bool,
+    fixed_single_key: bool,
+    fixed_yielded: bool,
 }
 
 impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
     pub(super) fn new(
         root: &'a mut Option<BtreeHeader>,
-        lower_bound: Bound<Vec<u8>>,
-        upper_bound: Bound<Vec<u8>>,
+        lower_bound: Bound<ScratchVec<u8>>,
+        upper_bound: Bound<ScratchVec<u8>>,
         page_allocator: PageAllocator,
-        master_free_list: Arc<Mutex<Vec<PageNumber>>>,
-        allocated: Arc<PageTracker>,
+        master_free_list: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+        allocated: NativeOwnedShared<PageTracker>,
     ) -> Self {
+        let fixed_single_key = page_allocator.is_checked_source();
         Self {
             tree: CursorTree::new(root, page_allocator, master_free_list, allocated),
             front: EndState::Parked(lower_bound),
             back: EndState::Parked(upper_bound),
             settled: None,
             poisoned: false,
+            fixed_single_key,
+            fixed_yielded: false,
         }
     }
 
@@ -2116,6 +2310,9 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
     }
 
     fn peek(&mut self, direction: Direction) -> Result<Option<EntryRef<'_, K, V>>> {
+        if self.fixed_single_key && (direction != Direction::Next || self.fixed_yielded) {
+            return Err(StorageError::PreviousIo);
+        }
         if !self.settle(direction)? {
             return Ok(None);
         }
@@ -2149,6 +2346,9 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
         &mut self,
         direction: Direction,
     ) -> Result<Option<(AccessGuard<'a, K>, AccessGuard<'a, V>)>> {
+        if self.fixed_single_key && (direction != Direction::Next || self.fixed_yielded) {
+            return Err(StorageError::PreviousIo);
+        }
         if !self.settle(direction)? {
             return Ok(None);
         }
@@ -2157,6 +2357,7 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
             Direction::Next => cursor.remove_next_deferred(),
             Direction::Previous => cursor.remove_prev_deferred(),
         })?;
+        self.fixed_yielded = self.fixed_single_key;
         Ok(Some(result.expect("settled entry must be removable")))
     }
 
@@ -2205,7 +2406,12 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
                 // The other end rewrote the leaf: apply the snapshot by key
                 // and reseek. Both steps require this end to hold no pages.
                 drop(state);
-                *self.end_mut(direction) = EndState::Parked(batch.bound.clone());
+                let bound = copy_cursor_bound(
+                    &self.tree.page_allocator,
+                    &batch.bound,
+                    FixedCursorKey::Seek,
+                )?;
+                *self.end_mut(direction) = EndState::Parked(bound);
                 self.resolve_batch(batch)?;
                 state = self.seek_end(direction)?;
             }
@@ -2216,17 +2422,30 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
 
     // Descends to the gap described by `direction`'s parked bound.
     fn seek_end(&mut self, direction: Direction) -> Result<CursorState> {
+        self.tree.prepare_local_freed()?;
+        let reserved_entries = self.tree.page_allocator.prepare_sparse_entries()?;
         let bound = match self.end_ref(direction) {
-            EndState::Parked(bound) => bound.clone(),
-            EndState::Pending(batch) => batch.bound.clone(),
+            EndState::Parked(bound) => {
+                copy_cursor_bound(&self.tree.page_allocator, bound, FixedCursorKey::Seek)?
+            }
+            EndState::Pending(batch) => copy_cursor_bound(
+                &self.tree.page_allocator,
+                &batch.bound,
+                FixedCursorKey::Seek,
+            )?,
             EndState::Live(_) => unreachable!("end must be parked"),
         };
-        let bound = bound.as_ref().map(Vec::as_slice);
+        let bound = bound.as_ref().map(|bytes| bytes.as_slice());
         let target = match direction {
             Direction::Next => Position::from_lower_bound(bound),
             Direction::Previous => Position::from_upper_bound(bound),
         };
-        let mut cursor = self.tree.cursor(CursorState::default());
+        let removed_indexes = self.tree.page_allocator.prepare_cursor_removed()?;
+        let mut cursor = self.tree.cursor(CursorState {
+            reserved_entries,
+            removed_indexes,
+            ..CursorState::default()
+        });
         let result = cursor.seek_to(target);
         let state = cursor.into_state();
         // On error the end stays parked, preserving any pending batch for close().
@@ -2239,6 +2458,7 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
     // are snapshotted and applied later.
     fn park(&mut self, direction: Direction) -> Result {
         self.settled = None;
+        let allocator = self.tree.page_allocator.clone();
         let end = self.end_mut(direction);
         let EndState::Live(state) = end else {
             return Ok(());
@@ -2246,7 +2466,7 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
         // Capture the parked form before the splice consumes the position.
         // The splice rewrites the parent, but not this leaf's memory, so the
         // snapshot stays valid.
-        let bound = park_bound::<K, V>(state, direction);
+        let bound = park_bound_prepared::<K, V>(&allocator, state, direction)?;
         let parked = if state.removed_indexes.is_empty() {
             EndState::Parked(bound)
         } else {
@@ -2286,6 +2506,7 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
     // error the range is poisoned: the batch was consumed, so its removals
     // can no longer be applied.
     fn resolve_batch(&mut self, batch: ParkedBatch) -> Result {
+        self.tree.prepare_local_freed()?;
         // Mutating would invalidate an open run's saved parent path; this
         // mirrors CursorMut::mutate_helper's chokepoint assert, which the raw
         // MutateHelper below bypasses.
@@ -2294,7 +2515,7 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
                 assert!(state.leaf_run_rewrite.is_none());
             }
         }
-        for &index in &batch.removed_indexes {
+        for &index in batch.removed_indexes.iter() {
             let key = LeafAccessor::new(&batch.leaf_bytes, K::fixed_width(), V::fixed_width())
                 .entry(index)
                 .expect("snapshot entry must exist")
@@ -2326,6 +2547,8 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
         direction: Direction,
         operation: impl FnOnce(&mut CursorMut<'a, '_, K, V>) -> Result<R>,
     ) -> Result<R> {
+        // Never consume a live/pending end before fallible scratch preparation.
+        self.tree.prepare_local_freed()?;
         let end = self.end_mut(direction);
         let EndState::Live(state) = core::mem::replace(end, EndState::Parked(Unbounded)) else {
             unreachable!("end must be live");
@@ -2384,6 +2607,18 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
     }
 }
 
+fn copy_cursor_bound(
+    allocator: &PageAllocator,
+    bound: &Bound<ScratchVec<u8>>,
+    role: FixedCursorKey,
+) -> Result<Bound<ScratchVec<u8>>> {
+    Ok(match bound {
+        Included(bytes) => Included(allocator.copy_cursor_key(role, bytes)?),
+        Excluded(bytes) => Excluded(allocator.copy_cursor_key(role, bytes)?),
+        Unbounded => Unbounded,
+    })
+}
+
 // Whether the cursor landed on a leaf whose memory is byte-identical to the
 // snapshot. Identical bytes imply an identical entry layout.
 fn snapshot_matches(state: &CursorState, snapshot: &[u8]) -> bool {
@@ -2397,6 +2632,51 @@ fn snapshot_matches(state: &CursorState, snapshot: &[u8]) -> bool {
 // a `RangeMut` and later reseek it. Bounds name a key adjacent to the gap in
 // the leaf's pre-flush memory; seeks resolve them by comparison, so they stay
 // correct even if the named key is itself a pending removal.
+fn park_bound_prepared<K: Key + 'static, V: Value + 'static>(
+    allocator: &PageAllocator,
+    state: &CursorState,
+    direction: Direction,
+) -> Result<Bound<ScratchVec<u8>>> {
+    // No position: the tree was empty, or a flush/seek error consumed it.
+    // Unbounded is safe only because those paths are terminal (the flush
+    // paths run from close(), and errors poison or latch); parking a live
+    // end Unbounded would un-consume everything it already yielded.
+    let Some(position) = state.position.as_ref() else {
+        return Ok(Unbounded);
+    };
+    let leaf = &position.leaf;
+    // A consumed leaf edge parks as the same exclusive boundary that flushes
+    // and splices resume from; the two must agree so that neither end of a
+    // range re-yields or skips an entry.
+    Ok(match direction {
+        Direction::Next if leaf.position < leaf.len => Included(cursor_key_data::<K, V>(
+            allocator,
+            leaf,
+            leaf.position,
+            FixedCursorKey::Park,
+        )?),
+        Direction::Previous if leaf.position > 0 => Included(cursor_key_data::<K, V>(
+            allocator,
+            leaf,
+            leaf.position - 1,
+            FixedCursorKey::Park,
+        )?),
+        _ => {
+            let index = match direction {
+                Direction::Next => leaf.len - 1,
+                Direction::Previous => 0,
+            };
+            Excluded(cursor_key_data::<K, V>(
+                allocator,
+                leaf,
+                index,
+                FixedCursorKey::Park,
+            )?)
+        }
+    })
+}
+
+#[cfg(test)]
 fn park_bound<K: Key + 'static, V: Value + 'static>(
     state: &CursorState,
     direction: Direction,
@@ -2446,9 +2726,11 @@ mod tests {
 
     // The returned tracker records the built page: mutations through a cursor
     // must share it, so the pages they free are found tracked.
-    fn leaf_root_with_entries(entries: &[u64]) -> (PageAllocator, PageNumber, Arc<PageTracker>) {
+    fn leaf_root_with_entries(
+        entries: &[u64],
+    ) -> (PageAllocator, PageNumber, NativeOwnedShared<PageTracker>) {
         let page_allocator = test_page_allocator();
-        let allocated_pages = Arc::new(PageTracker::new_tracking());
+        let allocated_pages = NativeOwnedShared::ordinary(PageTracker::new_tracking());
         let keys_and_values: Vec<_> = entries
             .iter()
             .map(|entry| {
@@ -2512,7 +2794,7 @@ mod tests {
     fn cursor_mut_stays_parked_at_tree_edge() {
         let (page_allocator, root_page, allocated) = leaf_root_with_entries(&[1, 2, 3]);
         let mut root = Some(BtreeHeader::new(root_page, DEFERRED, 3));
-        let mut freed = vec![];
+        let mut freed = NativeOwnedPageVec::default();
         let mut cursor: CursorMut<'_, '_, u64, u64> =
             CursorMut::new(&mut root, &page_allocator, &mut freed, &allocated);
 
@@ -2605,7 +2887,7 @@ mod tests {
             let mut untyped = UntypedBtreeMut::new(
                 root,
                 page_allocator.clone(),
-                Arc::new(Mutex::new(vec![])),
+                NativeOwnedShared::ordinary(Mutex::new(NativeOwnedPageVec::default())),
                 u64::fixed_width(),
                 u64::fixed_width(),
             );
@@ -2625,8 +2907,8 @@ mod tests {
             for flush_every in [1, 3, 64] {
                 let page_allocator = test_page_allocator();
                 let mut root = None;
-                let mut freed = vec![];
-                let allocated = Arc::new(PageTracker::new_tracking());
+                let mut freed = NativeOwnedPageVec::default();
+                let allocated = NativeOwnedShared::ordinary(PageTracker::new_tracking());
                 let mut cursor: CursorMut<'_, '_, u64, u64> =
                     CursorMut::new(&mut root, &page_allocator, &mut freed, &allocated);
                 cursor.seek_to(Position::End).unwrap();
@@ -2648,8 +2930,8 @@ mod tests {
         fn insert_run_grows_multiple_levels() {
             let page_allocator = test_page_allocator();
             let mut root = None;
-            let mut freed = vec![];
-            let allocated = Arc::new(PageTracker::new_tracking());
+            let mut freed = NativeOwnedPageVec::default();
+            let allocated = NativeOwnedShared::ordinary(PageTracker::new_tracking());
             let mut cursor: CursorMut<'_, '_, u64, u64> =
                 CursorMut::new(&mut root, &page_allocator, &mut freed, &allocated);
             cursor.seek_to(Position::End).unwrap();
@@ -2681,7 +2963,7 @@ mod tests {
             let existing: Vec<u64> = (0..100).map(|i| i * 10).collect();
             let (page_allocator, root_page, allocated) = leaf_root_with_entries(&existing);
             let mut root = Some(BtreeHeader::new(root_page, DEFERRED, existing.len() as u64));
-            let mut freed = vec![];
+            let mut freed = NativeOwnedPageVec::default();
             let mut cursor: CursorMut<'_, '_, u64, u64> =
                 CursorMut::new(&mut root, &page_allocator, &mut freed, &allocated);
             cursor
@@ -2705,7 +2987,7 @@ mod tests {
         fn insert_run_splits_root_leaf() {
             let (page_allocator, root_page, allocated) = leaf_root_with_entries(&[0, 1_000_000]);
             let mut root = Some(BtreeHeader::new(root_page, DEFERRED, 2));
-            let mut freed = vec![];
+            let mut freed = NativeOwnedPageVec::default();
             let mut cursor: CursorMut<'_, '_, u64, u64> =
                 CursorMut::new(&mut root, &page_allocator, &mut freed, &allocated);
             cursor
@@ -2731,8 +3013,8 @@ mod tests {
         fn insert_run_into_middle_of_tall_tree() {
             let page_allocator = test_page_allocator();
             let mut root = None;
-            let mut freed = vec![];
-            let allocated = Arc::new(PageTracker::new_tracking());
+            let mut freed = NativeOwnedPageVec::default();
+            let allocated = NativeOwnedShared::ordinary(PageTracker::new_tracking());
             let mut cursor: CursorMut<'_, '_, u64, u64> =
                 CursorMut::new(&mut root, &page_allocator, &mut freed, &allocated);
             cursor.seek_to(Position::End).unwrap();
@@ -2782,8 +3064,8 @@ mod tests {
         fn insert_run_swaps_ancestors_in_place() {
             let page_allocator = test_page_allocator();
             let mut root = None;
-            let mut freed = vec![];
-            let allocated = Arc::new(PageTracker::new_tracking());
+            let mut freed = NativeOwnedPageVec::default();
+            let allocated = NativeOwnedShared::ordinary(PageTracker::new_tracking());
             let mut cursor: CursorMut<'_, '_, u64, u64> =
                 CursorMut::new(&mut root, &page_allocator, &mut freed, &allocated);
             cursor.seek_to(Position::End).unwrap();
@@ -2835,7 +3117,7 @@ mod tests {
         fn insert_run_rejects_unordered_keys() {
             let (page_allocator, root_page, allocated) = leaf_root_with_entries(&[10, 20, 30]);
             let mut root = Some(BtreeHeader::new(root_page, DEFERRED, 3));
-            let mut freed = vec![];
+            let mut freed = NativeOwnedPageVec::default();
             let mut cursor: CursorMut<'_, '_, u64, u64> =
                 CursorMut::new(&mut root, &page_allocator, &mut freed, &allocated);
             cursor
@@ -2875,8 +3157,8 @@ mod tests {
             for flush_every in [1, 3, 64] {
                 let page_allocator = test_page_allocator();
                 let mut root = None;
-                let mut freed = vec![];
-                let allocated = Arc::new(PageTracker::new_tracking());
+                let mut freed = NativeOwnedPageVec::default();
+                let allocated = NativeOwnedShared::ordinary(PageTracker::new_tracking());
                 let mut cursor: CursorMut<'_, '_, u64, u64> =
                     CursorMut::new(&mut root, &page_allocator, &mut freed, &allocated);
                 cursor.seek_to(Position::Start).unwrap();
@@ -2901,7 +3183,7 @@ mod tests {
         fn insert_run_mixed_directions() {
             let (page_allocator, root_page, allocated) = leaf_root_with_entries(&[10, 20, 30]);
             let mut root = Some(BtreeHeader::new(root_page, DEFERRED, 3));
-            let mut freed = vec![];
+            let mut freed = NativeOwnedPageVec::default();
             let mut cursor: CursorMut<'_, '_, u64, u64> =
                 CursorMut::new(&mut root, &page_allocator, &mut freed, &allocated);
             cursor
@@ -2930,7 +3212,7 @@ mod tests {
         fn insert_run_after_rejects_unordered_keys() {
             let (page_allocator, root_page, allocated) = leaf_root_with_entries(&[10, 20, 30]);
             let mut root = Some(BtreeHeader::new(root_page, DEFERRED, 3));
-            let mut freed = vec![];
+            let mut freed = NativeOwnedPageVec::default();
             let mut cursor: CursorMut<'_, '_, u64, u64> =
                 CursorMut::new(&mut root, &page_allocator, &mut freed, &allocated);
             cursor
@@ -2974,7 +3256,7 @@ mod tests {
     fn poisoned_cursor_mut_re_raises() {
         let (page_allocator, root_page, allocated) = leaf_root_with_entries(&[1, 2, 3]);
         let mut root = Some(BtreeHeader::new(root_page, DEFERRED, 3));
-        let mut freed = vec![];
+        let mut freed = NativeOwnedPageVec::default();
         let mut cursor: CursorMut<'_, '_, u64, u64> =
             CursorMut::new(&mut root, &page_allocator, &mut freed, &allocated);
 

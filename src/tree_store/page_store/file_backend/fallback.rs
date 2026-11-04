@@ -16,12 +16,34 @@ pub struct FileBackend {
 }
 
 impl FileBackend {
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn fresh_readonly_full_range_capacity_bytes()
+    -> Result<u64, super::super::allocator_reopen_facts::AllocatorResourceError> {
+        Err(super::super::allocator_reopen_facts::AllocatorResourceError::Unsupported)
+    }
+    pub(crate) fn full_range_custody_quote_capture_bytes() -> Result<u64, crate::ReadOnlyReopenError>
+    {
+        // The qualified Source resource profile is not supported here.
+        Err(crate::ReadOnlyReopenError::Unsupported)
+    }
+    pub(crate) fn full_range_custody_retained_bytes(
+        &self,
+    ) -> Result<u64, crate::ReadOnlyReopenError> {
+        Err(crate::ReadOnlyReopenError::Unsupported)
+    }
+
     /// Creates a new backend which stores data to the given file.
     pub fn new(file: File) -> Result<Self, DatabaseError> {
         Ok(Self {
             whole_file_locked: AtomicBool::new(false),
             file: Mutex::new(file),
         })
+    }
+
+    // The closed readonly custody path cannot downgrade its separate exclusive
+    // legacy flock by substituting a shared whole-file fallback.
+    pub(crate) fn try_lock_shared_native_full_range(&self) -> Result<bool, BackendError> {
+        Err(BackendError::Unsupported)
     }
 
     fn lock_whole_file(&self, shared: bool) -> Result<bool, io::Error> {

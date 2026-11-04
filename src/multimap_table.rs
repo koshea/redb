@@ -5,6 +5,9 @@ use crate::multimap_table::DynamicCollectionType::{Inline, SubtreeV2};
 use crate::sealed::Sealed;
 use crate::sync::Mutex;
 use crate::table::{CompatBorrow, OwnedAccessGuard, ReadableTableMetadata, TableStats};
+use crate::tree_store::NativeOwnedPageVec;
+use crate::tree_store::NativeOwnedShared;
+use crate::tree_store::SharedPageBytes;
 #[cfg(not(feature = "experimental-api-5"))]
 use crate::tree_store::encode_bounds;
 use crate::tree_store::{
@@ -32,7 +35,7 @@ pub(crate) struct LeafKeyIter<'a, V: Key + 'static> {
     // Kept alive so any Drop side-effects on `data` (e.g. `remove_on_drop`) still run.
     _inline_collection: AccessGuard<'a, &'static DynamicCollection<V>>,
     // Arc-backed view of the page holding the inline collection.
-    page_data: Arc<[u8]>,
+    page_data: SharedPageBytes,
     // Byte range in `page_data` holding the inline leaf data for the collection.
     inline_range: Range<usize>,
     fixed_key_size: Option<usize>,
@@ -116,10 +119,10 @@ enum ValueIterState<'a, V: Key + 'static> {
 pub struct MultimapValue<'a, V: Key + 'static> {
     inner: Option<ValueIterState<'a, V>>,
     remaining: u64,
-    freed_pages: Option<Arc<Mutex<Vec<PageNumber>>>>,
-    allocated_pages: Arc<PageTracker>,
+    freed_pages: Option<NativeOwnedShared<Mutex<NativeOwnedPageVec>>>,
+    allocated_pages: NativeOwnedShared<PageTracker>,
     free_on_drop: Vec<PageNumber>,
-    _transaction_guard: Arc<TransactionGuard>,
+    _transaction_guard: NativeOwnedShared<TransactionGuard>,
     page_allocator: Option<PageAllocator>,
     _value_type: PhantomData<V>,
 }
@@ -128,13 +131,13 @@ impl<'a, V: Key + 'static> MultimapValue<'a, V> {
     fn new_subtree(
         inner: BtreeCursorRange<V, ()>,
         num_values: u64,
-        guard: Arc<TransactionGuard>,
+        guard: NativeOwnedShared<TransactionGuard>,
     ) -> Self {
         Self {
             inner: Some(ValueIterState::Subtree(Box::new(inner))),
             remaining: num_values,
             freed_pages: None,
-            allocated_pages: Arc::new(PageTracker::closed()),
+            allocated_pages: NativeOwnedShared::ordinary(PageTracker::closed()),
             free_on_drop: vec![],
             _transaction_guard: guard,
             page_allocator: None,
@@ -145,10 +148,10 @@ impl<'a, V: Key + 'static> MultimapValue<'a, V> {
     fn new_subtree_free_on_drop(
         inner: BtreeCursorRange<V, ()>,
         num_values: u64,
-        freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-        allocated_pages: Arc<PageTracker>,
+        freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+        allocated_pages: NativeOwnedShared<PageTracker>,
         pages: Vec<PageNumber>,
-        guard: Arc<TransactionGuard>,
+        guard: NativeOwnedShared<TransactionGuard>,
         page_allocator: PageAllocator,
     ) -> Self {
         Self {
@@ -163,13 +166,13 @@ impl<'a, V: Key + 'static> MultimapValue<'a, V> {
         }
     }
 
-    fn new_inline(inner: LeafKeyIter<'a, V>, guard: Arc<TransactionGuard>) -> Self {
+    fn new_inline(inner: LeafKeyIter<'a, V>, guard: NativeOwnedShared<TransactionGuard>) -> Self {
         let remaining = inner.num_values();
         Self {
             inner: Some(ValueIterState::InlineLeaf(inner)),
             remaining,
             freed_pages: None,
-            allocated_pages: Arc::new(PageTracker::closed()),
+            allocated_pages: NativeOwnedShared::ordinary(PageTracker::closed()),
             free_on_drop: vec![],
             _transaction_guard: guard,
             page_allocator: None,
@@ -179,7 +182,7 @@ impl<'a, V: Key + 'static> MultimapValue<'a, V> {
 
     fn from_collection(
         collection: AccessGuard<'a, &'static DynamicCollection<V>>,
-        guard: Arc<TransactionGuard>,
+        guard: NativeOwnedShared<TransactionGuard>,
         mem: PageResolver,
     ) -> Result<Self> {
         Ok(match collection.value().collection_type() {
@@ -207,9 +210,9 @@ impl<'a, V: Key + 'static> MultimapValue<'a, V> {
     fn from_collection_free_on_drop(
         collection: AccessGuard<'a, &'static DynamicCollection<V>>,
         pages: Vec<PageNumber>,
-        freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-        allocated_pages: Arc<PageTracker>,
-        guard: Arc<TransactionGuard>,
+        freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+        allocated_pages: NativeOwnedShared<PageTracker>,
+        guard: NativeOwnedShared<TransactionGuard>,
         page_allocator: PageAllocator,
     ) -> Result<Self> {
         let num_values = collection.value().get_num_values();
@@ -333,7 +336,7 @@ impl<V: Key + 'static> Drop for MultimapValue<'_, V> {
 pub struct MultimapRange<'a, K: Key + 'static, V: Key + 'static> {
     inner: BtreeCursorRange<K, &'static DynamicCollection<V>>,
     mem: PageResolver,
-    transaction_guard: Arc<TransactionGuard>,
+    transaction_guard: NativeOwnedShared<TransactionGuard>,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
     // Keeps the table borrowed for as long as the range is alive; see `ScopedBorrow`
@@ -343,7 +346,7 @@ pub struct MultimapRange<'a, K: Key + 'static, V: Key + 'static> {
 impl<K: Key + 'static, V: Key + 'static> MultimapRange<'_, K, V> {
     fn new(
         inner: BtreeCursorRange<K, &'static DynamicCollection<V>>,
-        guard: Arc<TransactionGuard>,
+        guard: NativeOwnedShared<TransactionGuard>,
         mem: PageResolver,
     ) -> Self {
         Self {
@@ -434,11 +437,11 @@ impl<K: Key + 'static, V: Key + 'static> DoubleEndedIterator for MultimapRange<'
 /// yields keep the read transaction alive until they are dropped.
 pub struct OwnedMultimapValue<V: Key + 'static> {
     inner: MultimapValue<'static, V>,
-    transaction_guard: Arc<TransactionGuard>,
+    transaction_guard: NativeOwnedShared<TransactionGuard>,
 }
 
 impl<V: Key + 'static> OwnedMultimapValue<V> {
-    fn new(inner: MultimapValue<'static, V>, guard: Arc<TransactionGuard>) -> Self {
+    fn new(inner: MultimapValue<'static, V>, guard: NativeOwnedShared<TransactionGuard>) -> Self {
         Self {
             inner,
             transaction_guard: guard,
@@ -481,11 +484,14 @@ impl<V: Key + 'static> DoubleEndedIterator for OwnedMultimapValue<V> {
 /// the read transaction alive until they are dropped.
 pub struct OwnedMultimapRange<K: Key + 'static, V: Key + 'static> {
     inner: MultimapRange<'static, K, V>,
-    transaction_guard: Arc<TransactionGuard>,
+    transaction_guard: NativeOwnedShared<TransactionGuard>,
 }
 
 impl<K: Key + 'static, V: Key + 'static> OwnedMultimapRange<K, V> {
-    fn new(inner: MultimapRange<'static, K, V>, guard: Arc<TransactionGuard>) -> Self {
+    fn new(
+        inner: MultimapRange<'static, K, V>,
+        guard: NativeOwnedShared<TransactionGuard>,
+    ) -> Self {
         Self {
             inner,
             transaction_guard: guard,
@@ -528,8 +534,8 @@ pub struct MultimapTable<'txn, K: Key + 'static, V: Key + 'static> {
     name: String,
     num_values: u64,
     transaction: &'txn WriteTransaction,
-    freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-    allocated_pages: Arc<PageTracker>,
+    freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+    allocated_pages: NativeOwnedShared<PageTracker>,
     tree: BtreeMut<K, &'static DynamicCollection<V>>,
     page_allocator: PageAllocator,
     _value_type: PhantomData<V>,
@@ -547,8 +553,8 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
         name: &str,
         table_root: Option<BtreeHeader>,
         num_values: u64,
-        freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-        allocated_pages: Arc<PageTracker>,
+        freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+        allocated_pages: NativeOwnedShared<PageTracker>,
         page_allocator: PageAllocator,
         transaction: &'txn WriteTransaction,
     ) -> MultimapTable<'txn, K, V> {
@@ -1069,7 +1075,7 @@ pub struct ReadOnlyUntypedMultimapTable {
     fixed_key_size: Option<usize>,
     fixed_value_size: Option<usize>,
     mem: PageResolver,
-    _transaction_guard: Arc<TransactionGuard>,
+    _transaction_guard: NativeOwnedShared<TransactionGuard>,
 }
 
 impl Sealed for ReadOnlyUntypedMultimapTable {}
@@ -1113,7 +1119,7 @@ impl ReadOnlyUntypedMultimapTable {
         num_values: u64,
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
-        guard: Arc<TransactionGuard>,
+        guard: NativeOwnedShared<TransactionGuard>,
         mem: PageResolver,
     ) -> Self {
         Self {
@@ -1141,7 +1147,7 @@ pub struct ReadOnlyMultimapTable<K: Key + 'static, V: Key + 'static> {
     tree: Btree<K, &'static DynamicCollection<V>>,
     num_values: u64,
     mem: PageResolver,
-    transaction_guard: Arc<TransactionGuard>,
+    transaction_guard: NativeOwnedShared<TransactionGuard>,
     _value_type: PhantomData<V>,
 }
 
@@ -1157,7 +1163,7 @@ impl<K: Key + 'static, V: Key + 'static> ReadOnlyMultimapTable<K, V> {
         root: Option<BtreeHeader>,
         num_values: u64,
         hint: PageHint,
-        guard: Arc<TransactionGuard>,
+        guard: NativeOwnedShared<TransactionGuard>,
         mem: PageResolver,
     ) -> Result<ReadOnlyMultimapTable<K, V>> {
         Ok(ReadOnlyMultimapTable {

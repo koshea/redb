@@ -220,6 +220,10 @@ impl SerializedSavepoint<'_> {
     }
 }
 
+impl crate::types::NativeResourceTypeName for SerializedSavepoint<'_> {
+    const INTERNAL_RESOURCE_NAME: &'static str = "redb::SerializedSavepoint";
+}
+
 impl Value for SerializedSavepoint<'_> {
     type SelfType<'a>
         = SerializedSavepoint<'a>
@@ -249,7 +253,7 @@ impl Value for SerializedSavepoint<'_> {
     }
 
     fn type_name() -> TypeName {
-        TypeName::internal("redb::SerializedSavepoint")
+        TypeName::internal(<Self as crate::types::NativeResourceTypeName>::INTERNAL_RESOURCE_NAME)
     }
 }
 

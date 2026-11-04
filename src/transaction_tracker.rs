@@ -53,6 +53,10 @@ impl SavepointId {
     }
 }
 
+impl crate::types::NativeResourceTypeName for SavepointId {
+    const INTERNAL_RESOURCE_NAME: &'static str = "redb::SavepointId";
+}
+
 impl Value for SavepointId {
     type SelfType<'a> = SavepointId;
     type AsBytes<'a> = [u8; size_of::<u64>()];
@@ -76,7 +80,7 @@ impl Value for SavepointId {
     }
 
     fn type_name() -> TypeName {
-        TypeName::internal("redb::SavepointId")
+        TypeName::internal(<Self as crate::types::NativeResourceTypeName>::INTERNAL_RESOURCE_NAME)
     }
 }
 
@@ -91,6 +95,9 @@ impl Key for SavepointId {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum WriteSlotState {
     Free,
+    // Bounded SYSTEM inspection excludes ordinary native writers but issues
+    // no transaction ID and changes no current-root resource generation.
+    Inspecting(u64),
     // The slot is taken and the writer byte is being acquired, which waits on any peer that
     // holds it. There is no transaction id yet: it is issued from the file's latest commit,
     // which is only known once the byte is held
@@ -102,15 +109,274 @@ enum WriteSlotState {
     Finalizing,
 }
 
+#[cfg(all(test, not(redb_no_std)))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PlannedReadTrackerSnapshot {
+    pub(crate) ordinary_entries: usize,
+    pub(crate) ordinary_references: u64,
+    pub(crate) ordinary_at_slot: u64,
+    pub(crate) planned_id: Option<TransactionId>,
+    pub(crate) planned_serial: Option<u64>,
+    pub(crate) oldest: Option<TransactionId>,
+    pub(crate) planned_matches_pending: bool,
+}
+#[cfg(all(test, not(redb_no_std)))]
+pub(crate) struct ReclamationTrackerSnapshot {
+    pub(crate) savepoints: usize,
+    pub(crate) persistent_savepoints: usize,
+    pub(crate) pending: usize,
+    pub(crate) first_pending: Option<(TransactionId, TransactionId)>,
+    pub(crate) unprocessed: usize,
+}
+
+// Private planning state, never a durable/root or complete resource certificate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeResourcePlanningRefusal {
+    Busy,
+    Stale,
+    Unsupported,
+    Exhausted,
+    Poisoned,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct NativeTrackerProfile {
+    single_pending: Option<(TransactionId, TransactionId)>,
+    unprocessed_freed_ids: usize,
+}
+
+// The outer native plan must additionally borrow its actual Database and own
+// admitted native read/page pins. This epoch alone authorizes no physical read.
+pub(crate) struct NativeResourceEpoch<'tracker> {
+    actual: &'tracker TransactionTracker,
+    generation: u64,
+    profile: NativeTrackerProfile,
+    inspection_serial: Option<u64>,
+}
+
+impl NativeResourceEpoch<'_> {
+    // Pure cfgtest comparison of two genuine native epoch captures. No raw
+    // stamp is exposed or accepted, and no generation can be installed.
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn same_generation_for_test(&self, other: &Self) -> bool {
+        core::ptr::eq(self.actual, other.actual) && self.generation == other.generation
+    }
+
+    // SYSTEM pages need this real inspection exclusion, never USER MVCC alone.
+    pub(crate) fn require_system_inspection_for(
+        &self,
+        tracker: &Arc<TransactionTracker>,
+    ) -> core::result::Result<(), NativeResourcePlanningRefusal> {
+        if self.inspection_serial.is_none() {
+            return Err(NativeResourcePlanningRefusal::Unsupported);
+        }
+        self.require_tracker(tracker)
+    }
+    pub(crate) fn require_tracker(
+        &self,
+        actual: &TransactionTracker,
+    ) -> core::result::Result<(), NativeResourcePlanningRefusal> {
+        if !core::ptr::eq(self.actual, actual) {
+            return Err(NativeResourcePlanningRefusal::Stale);
+        }
+        self.require_current()
+    }
+
+    // Numerical proposals from the actual tracker state. The owning system
+    // read supplies its matching committed read ID; no mutation is authorized.
+    pub(crate) fn observe_native_write_counters(
+        &self,
+        committed: TransactionId,
+    ) -> core::result::Result<(TransactionId, TransactionId), NativeResourcePlanningRefusal> {
+        let state = self
+            .actual
+            .state
+            .lock()
+            .map_err(|_| NativeResourcePlanningRefusal::Poisoned)?;
+        self.actual.require_resource_epoch(&state, self)?;
+        let next = state
+            .next_transaction_id
+            .max(committed)
+            .raw_id()
+            .checked_add(1)
+            .ok_or(NativeResourcePlanningRefusal::Exhausted)?;
+        // The actual current read remains live, so a local floor must exist.
+        // ExclusiveWriter is checked by the system-read owner: no peer scan.
+        let oldest = state
+            .oldest_read_reference()
+            .ok_or(NativeResourcePlanningRefusal::Unsupported)?;
+        let horizon = oldest
+            .raw_id()
+            .checked_add(1)
+            .ok_or(NativeResourcePlanningRefusal::Exhausted)?;
+        Ok((TransactionId::new(next), TransactionId::new(horizon)))
+    }
+
+    pub(crate) fn single_pending(&self) -> Option<(TransactionId, TransactionId)> {
+        self.profile.single_pending
+    }
+
+    pub(crate) fn unprocessed_freed_ids(&self) -> usize {
+        self.profile.unprocessed_freed_ids
+    }
+
+    pub(crate) fn require_current(
+        &self,
+    ) -> core::result::Result<(), NativeResourcePlanningRefusal> {
+        let state = self
+            .actual
+            .state
+            .lock()
+            .map_err(|_| NativeResourcePlanningRefusal::Poisoned)?;
+        self.actual.require_resource_epoch(&state, self)
+    }
+}
+
+// A numerical seal borrowing the actual tracker, not the movable epoch value.
+// It cannot claim a writer or mint an actual read; only the original epoch can.
+#[cfg(not(redb_no_std))]
+pub(crate) struct NativeDetachedResourceEpoch<'tracker> {
+    actual: &'tracker TransactionTracker,
+    generation: u64,
+    profile: NativeTrackerProfile,
+}
+#[cfg(not(redb_no_std))]
+impl<'tracker> NativeResourceEpoch<'tracker> {
+    pub(crate) fn seal_detached(
+        &self,
+    ) -> core::result::Result<NativeDetachedResourceEpoch<'tracker>, NativeResourcePlanningRefusal>
+    {
+        if self.inspection_serial.is_some() {
+            return Err(NativeResourcePlanningRefusal::Unsupported);
+        }
+        self.require_current()?;
+        Ok(NativeDetachedResourceEpoch {
+            actual: self.actual,
+            generation: self.generation,
+            profile: self.profile,
+        })
+    }
+}
+#[cfg(not(redb_no_std))]
+impl NativeDetachedResourceEpoch<'_> {
+    pub(crate) fn require_writer(
+        &self,
+        actual: &TransactionTracker,
+        id: TransactionId,
+    ) -> core::result::Result<(), NativeResourcePlanningRefusal> {
+        let state = actual
+            .state
+            .lock()
+            .map_err(|_| NativeResourcePlanningRefusal::Poisoned)?;
+        actual.require_prepared_writer_parts(&state, self.actual, self.generation, self.profile, id)
+    }
+
+    pub(crate) fn require_for(
+        &self,
+        actual: &TransactionTracker,
+        committed: TransactionId,
+        expected_next: TransactionId,
+    ) -> core::result::Result<(), NativeResourcePlanningRefusal> {
+        let state = actual
+            .state
+            .lock()
+            .map_err(|_| NativeResourcePlanningRefusal::Poisoned)?;
+        actual.require_resource_parts(&state, self.actual, self.generation, self.profile, None)?;
+        let next = state
+            .next_transaction_id
+            .max(committed)
+            .raw_id()
+            .checked_add(1)
+            .ok_or(NativeResourcePlanningRefusal::Exhausted)?;
+        if TransactionId::new(next) != expected_next {
+            return Err(NativeResourcePlanningRefusal::Stale);
+        }
+        // Preserve the already prepared horizon; no live read floor is needed.
+        Ok(())
+    }
+}
+
+// Only try_claim_resource_write_slot mints this value, and immediately transfers
+// it into the existing WriteSlot. No successful bare slot claim escapes.
+pub(crate) struct NativeResourceSlotClaim {
+    tracker: Arc<TransactionTracker>,
+}
+
+impl NativeResourceSlotClaim {
+    pub(crate) fn into_tracker(self) -> Arc<TransactionTracker> {
+        self.tracker
+    }
+}
+
+pub(crate) struct NativeSystemInspectionClaim {
+    tracker: Arc<TransactionTracker>,
+    serial: u64,
+}
+impl NativeSystemInspectionClaim {
+    pub(crate) fn actual_tracker(&self) -> &Arc<TransactionTracker> {
+        &self.tracker
+    }
+}
+
+// One optional numerical-read pin, allocated inline with the actual tracker.
+// It is independent of ordinary and savepoint map references at the same ID.
+#[derive(Clone, Copy)]
+struct PlannedReadSlot {
+    transaction_id: TransactionId,
+    serial: u64,
+    actual_memory: usize,
+}
+#[cfg(not(redb_no_std))]
+pub(crate) struct NativePlannedReadSnapshot<'owner> {
+    actual_tracker: &'owner TransactionTracker,
+    actual_memory: &'owner TransactionalMemory,
+    transaction_id: TransactionId,
+    root: Option<BtreeHeader>,
+    generation: u64,
+}
+#[cfg(not(redb_no_std))]
+#[derive(Debug)]
+pub(crate) enum NativePlannedReadError {
+    Resource(NativeResourcePlanningRefusal),
+    Storage(StorageError),
+}
+#[cfg(not(redb_no_std))]
+impl From<StorageError> for NativePlannedReadError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+// Only the closed Source Immediate executor may install/register this tail.
+// Its internal ancestor is independent of every ordinary/planned read at that ID.
+#[cfg(not(redb_no_std))]
+#[derive(Clone, Copy)]
+struct SourcePendingTail {
+    id: TransactionId,
+    durable_ancestor: TransactionId,
+}
+#[cfg(not(redb_no_std))]
+#[derive(Clone, Copy)]
+struct SourceTailPreparationStamp {
+    actual_memory: usize,
+    writer_id: TransactionId,
+    generation: u64,
+}
+
 struct State {
     next_savepoint_id: SavepointId,
     next_local_savepoint_id: LocalSavepointId,
     // reference count of read transactions per transaction id
     live_read_transactions: BTreeMap<TransactionId, u64>,
+    planned_read_slot: Option<PlannedReadSlot>,
+    next_planned_read_serial: Option<u64>,
     // Subset of live_read_transactions which are persistent savepoints
     persistent_savepoint_references: BTreeMap<TransactionId, u64>,
     next_transaction_id: TransactionId,
     write_slot: WriteSlotState,
+    // Changes before any ordinary write initialization, including aborted turns.
+    // Exhaustion disables only optional resource planning, never ordinary writes.
+    resource_generation: Option<u64>,
+    next_inspection_serial: Option<u64>,
     valid_savepoints: BTreeMap<SavepointId, SavepointRegistration>,
     // Subset of valid_savepoints that are persistent
     persistent_savepoints: BTreeSet<SavepointId>,
@@ -120,6 +386,12 @@ struct State {
     //
     // Maps non-durable transaction id -> durable ancestor
     pending_non_durable_commits: BTreeMap<TransactionId, TransactionId>,
+    #[cfg(not(redb_no_std))]
+    source_pending_tail: Option<SourcePendingTail>,
+    #[cfg(not(redb_no_std))]
+    source_tail_preparation: Option<SourceTailPreparationStamp>,
+    #[cfg(not(redb_no_std))]
+    source_freed_markers: Option<crate::tree_store::NativeOwnedTransactionMarkers>,
     // Non-durable commits which have NOT been processed in the freed table
     unprocessed_freed_non_durable_commits: BTreeSet<TransactionId>,
     // Set when the Database was dropped while a write transaction was live. That transaction
@@ -129,6 +401,108 @@ struct State {
 }
 
 impl State {
+    fn source_ancestor_reference(&self) -> Option<TransactionId> {
+        #[cfg(not(redb_no_std))]
+        if let Some(tail) = self.source_pending_tail {
+            return Some(tail.durable_ancestor);
+        }
+        None
+    }
+    fn pending_contains(&self, id: TransactionId) -> bool {
+        #[cfg(not(redb_no_std))]
+        if self.source_pending_tail.is_some_and(|tail| tail.id == id) {
+            return true;
+        }
+        self.pending_non_durable_commits.contains_key(&id)
+    }
+    fn pending_count(&self) -> usize {
+        let count = self.pending_non_durable_commits.len();
+        #[cfg(not(redb_no_std))]
+        let count = count
+            .checked_add(usize::from(self.source_pending_tail.is_some()))
+            .expect("native pending owner count fits its address space");
+        count
+    }
+    fn first_pending(&self) -> Option<(TransactionId, TransactionId)> {
+        let ordinary = self
+            .pending_non_durable_commits
+            .first_key_value()
+            .map(|(&id, &ancestor)| (id, ancestor));
+        #[cfg(not(redb_no_std))]
+        if let Some(tail) = self.source_pending_tail {
+            let source = (tail.id, tail.durable_ancestor);
+            return Some(ordinary.map_or(
+                source,
+                |value| if value.0 < source.0 { value } else { source },
+            ));
+        }
+        ordinary
+    }
+    fn source_unprocessed_first(&self) -> Option<TransactionId> {
+        #[cfg(not(redb_no_std))]
+        if let Some(markers) = &self.source_freed_markers {
+            return markers.first();
+        }
+        None
+    }
+    fn unprocessed_contains(&self, id: TransactionId) -> bool {
+        #[cfg(not(redb_no_std))]
+        if self
+            .source_freed_markers
+            .as_ref()
+            .is_some_and(|markers| markers.contains(id))
+        {
+            return true;
+        }
+        self.unprocessed_freed_non_durable_commits.contains(&id)
+    }
+    fn unprocessed_count(&self) -> usize {
+        let count = self.unprocessed_freed_non_durable_commits.len();
+        #[cfg(not(redb_no_std))]
+        let count = count
+            .checked_add(
+                self.source_freed_markers
+                    .as_ref()
+                    .map_or(0, |markers| markers.len()),
+            )
+            .expect("native freed marker count fits its address space");
+        count
+    }
+    fn oldest_read_reference(&self) -> Option<TransactionId> {
+        let ordinary = self.live_read_transactions.keys().next().copied();
+        let ordinary = match (ordinary, self.source_ancestor_reference()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        match self.planned_read_slot {
+            Some(slot) => {
+                Some(ordinary.map_or(slot.transaction_id, |id| id.min(slot.transaction_id)))
+            }
+            None => ordinary,
+        }
+    }
+    fn advance_resource_generation(&mut self) {
+        self.resource_generation = self
+            .resource_generation
+            .and_then(|value| value.checked_add(1));
+    }
+
+    fn resource_profile(
+        &self,
+    ) -> core::result::Result<NativeTrackerProfile, NativeResourcePlanningRefusal> {
+        if !self.valid_savepoints.is_empty()
+            || !self.persistent_savepoints.is_empty()
+            || !self.persistent_savepoint_references.is_empty()
+            || self.pending_count() > 1
+        {
+            return Err(NativeResourcePlanningRefusal::Unsupported);
+        }
+        Ok(NativeTrackerProfile {
+            single_pending: self.first_pending(),
+            unprocessed_freed_ids: self.unprocessed_count(),
+        })
+    }
+
     fn register_savepoint(
         &mut self,
         id: SavepointId,
@@ -155,7 +529,16 @@ impl State {
             .unwrap_or(0);
         references
             .checked_sub(savepoints)
-            .expect("persistent savepoint references exceed the reads they are a subset of")
+            .and_then(|count| {
+                count.checked_add(u64::from(
+                    self.planned_read_slot
+                        .is_some_and(|slot| slot.transaction_id == id),
+                ))
+            })
+            .and_then(|count| {
+                count.checked_add(u64::from(self.source_ancestor_reference() == Some(id)))
+            })
+            .expect("native read reference counts are internally consistent")
     }
 
     // Takes the "active transaction byte" as the first read of `id` appears, and releases it
@@ -244,40 +627,386 @@ impl State {
     }
 }
 
+#[cfg(not(redb_no_std))]
+pub(crate) struct NativeSourceNoSavepointWriteProfile {
+    actual_tracker: usize,
+    actual_memory: usize,
+    transaction_id: TransactionId,
+    generation: u64,
+}
+#[cfg(not(redb_no_std))]
+impl NativeSourceNoSavepointWriteProfile {
+    pub(crate) fn require_for(
+        &self,
+        tracker: &TransactionTracker,
+        memory: &TransactionalMemory,
+        guard: &crate::db::TransactionGuard,
+    ) -> Result {
+        let current = tracker.check_source_no_savepoint_writer(memory, guard)?;
+        if self.actual_tracker != current.actual_tracker
+            || self.actual_memory != current.actual_memory
+            || self.transaction_id != current.transaction_id
+            || self.generation != current.generation
+        {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct TransactionTracker {
     state: Mutex<State>,
     live_write_transaction_available: Condvar,
+    #[cfg(all(test, not(redb_no_std)))]
+    inspection_wait_notification: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
 }
 
 impl TransactionTracker {
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn require_ordinary_cache_handoff_writer(
+        &self,
+        memory: &TransactionalMemory,
+        guard: &crate::db::TransactionGuard,
+    ) -> Result<()> {
+        if !guard.is_exclusive_writer_for(memory, self)
+            || self.state.lock()?.write_slot != WriteSlotState::Live(guard.id())
+        {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        // No savepoint exclusion: ordinary writers retain their full behavior.
+        Ok(())
+    }
+
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn check_source_no_savepoint_writer(
+        &self,
+        memory: &TransactionalMemory,
+        guard: &crate::db::TransactionGuard,
+    ) -> Result<NativeSourceNoSavepointWriteProfile> {
+        if !guard.is_exclusive_writer_for(memory, self) {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        let state = self.state.lock()?;
+        if state.write_slot != WriteSlotState::Live(guard.id())
+            || !state.valid_savepoints.is_empty()
+            || !state.persistent_savepoints.is_empty()
+            || !state.persistent_savepoint_references.is_empty()
+        {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        let generation = state
+            .resource_generation
+            .ok_or_else(crate::tree_store::source_owner_refused)?;
+        Ok(NativeSourceNoSavepointWriteProfile {
+            actual_tracker: core::ptr::from_ref(self) as usize,
+            actual_memory: core::ptr::from_ref(memory) as usize,
+            transaction_id: guard.id(),
+            generation,
+        })
+    }
+
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn planned_read_capture_inline_bytes() -> usize {
+        core::mem::size_of::<crate::sync::MutexGuard<'static, State>>()
+            + core::mem::size_of::<NativePlannedReadSnapshot<'static>>()
+            + core::mem::size_of::<NativePlannedReadError>()
+    }
+    pub(crate) fn readonly_capacity_bytes()
+    -> core::result::Result<u64, crate::tree_store::AllocatorResourceError> {
+        use crate::tree_store::{
+            ReadOnlyResourceProfile as P, readonly_tracker_node_capacity_bytes,
+        };
+        P::arc_allocation::<Self>()?
+            .checked_add(readonly_tracker_node_capacity_bytes()?)
+            .ok_or(crate::tree_store::AllocatorResourceError::Overflow)
+    }
     pub(crate) fn new(next_transaction_id: TransactionId) -> Self {
         Self {
             state: Mutex::new(State {
                 next_savepoint_id: SavepointId(0),
                 next_local_savepoint_id: LocalSavepointId(0),
                 live_read_transactions: BTreeMap::default(),
+                planned_read_slot: None,
+                next_planned_read_serial: Some(1),
                 persistent_savepoint_references: BTreeMap::default(),
                 next_transaction_id,
                 write_slot: WriteSlotState::Free,
+                resource_generation: Some(0),
+                next_inspection_serial: Some(0),
                 valid_savepoints: BTreeMap::default(),
                 persistent_savepoints: BTreeSet::default(),
                 pending_non_durable_commits: BTreeMap::default(),
+                #[cfg(not(redb_no_std))]
+                source_pending_tail: None,
+                #[cfg(not(redb_no_std))]
+                source_tail_preparation: None,
+                #[cfg(not(redb_no_std))]
+                source_freed_markers: None,
                 unprocessed_freed_non_durable_commits: BTreeSet::default(),
                 deferred_close: None,
             }),
             live_write_transaction_available: Condvar::new(),
+            #[cfg(all(test, not(redb_no_std)))]
+            inspection_wait_notification: Mutex::new(None),
         }
     }
 
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn planned_read_snapshot_for_test(&self) -> PlannedReadTrackerSnapshot {
+        let state = self.state.lock().unwrap();
+        let planned_id = state.planned_read_slot.map(|slot| slot.transaction_id);
+        PlannedReadTrackerSnapshot {
+            ordinary_entries: state.live_read_transactions.len(),
+            ordinary_references: state.live_read_transactions.values().copied().sum(),
+            ordinary_at_slot: planned_id
+                .and_then(|id| state.live_read_transactions.get(&id).copied())
+                .unwrap_or(0),
+            planned_id,
+            planned_serial: state.planned_read_slot.map(|slot| slot.serial),
+            oldest: state.oldest_read_reference(),
+            planned_matches_pending: planned_id.is_some_and(|id| state.pending_contains(id)),
+        }
+    }
     // Takes the write slot, waiting for the write transaction that holds it to end. The
     // transaction's id is issued separately, by `issue_write_transaction_id()`, once the file's
     // latest commit is known.
     pub(crate) fn take_write_slot(&self) {
         let mut state = self.state.lock().unwrap();
         while state.write_slot != WriteSlotState::Free {
+            #[cfg(all(test, not(redb_no_std)))]
+            if matches!(state.write_slot, WriteSlotState::Inspecting(_)) {
+                if let Some(notification) = self.inspection_wait_notification.lock().unwrap().take()
+                {
+                    // Bounded one-shot signal only. The real Condvar below,
+                    // not a test barrier, excludes the ordinary writer.
+                    // A failing test may have already dropped its receiver.
+                    // Never poison the actual tracker during test teardown.
+                    let _ = notification.try_send(());
+                }
+            }
             state = self.live_write_transaction_available.wait(state).unwrap();
         }
+        state.advance_resource_generation();
         state.write_slot = WriteSlotState::Initializing;
+    }
+
+    // Constant work over tracker metadata. One pending pair is only the tracker
+    // part of the epilogue class; the memory owner must prove post-only state,
+    // exact latest/durable IDs and admitted capacities before any native read.
+    pub(crate) fn capture_resource_epoch(
+        &self,
+    ) -> core::result::Result<NativeResourceEpoch<'_>, NativeResourcePlanningRefusal> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| NativeResourcePlanningRefusal::Poisoned)?;
+        if state.write_slot != WriteSlotState::Free {
+            return Err(NativeResourcePlanningRefusal::Busy);
+        }
+        let generation = state
+            .resource_generation
+            .ok_or(NativeResourcePlanningRefusal::Exhausted)?;
+        Ok(NativeResourceEpoch {
+            actual: self,
+            generation,
+            profile: state.resource_profile()?,
+            inspection_serial: None,
+        })
+    }
+
+    pub(crate) fn require_prepared_resource_writer(
+        &self,
+        epoch: &NativeResourceEpoch<'_>,
+        actual: TransactionId,
+    ) -> core::result::Result<(), NativeResourcePlanningRefusal> {
+        if epoch.inspection_serial.is_some() {
+            return Err(NativeResourcePlanningRefusal::Unsupported);
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| NativeResourcePlanningRefusal::Poisoned)?;
+        self.require_prepared_writer_parts(
+            &state,
+            epoch.actual,
+            epoch.generation,
+            epoch.profile,
+            actual,
+        )
+    }
+
+    fn require_prepared_writer_parts(
+        &self,
+        state: &State,
+        prepared_owner: &TransactionTracker,
+        prepared_generation: u64,
+        prepared_profile: NativeTrackerProfile,
+        actual: TransactionId,
+    ) -> core::result::Result<(), NativeResourcePlanningRefusal> {
+        let generation = prepared_generation
+            .checked_add(1)
+            .ok_or(NativeResourcePlanningRefusal::Exhausted)?;
+        if !core::ptr::eq(self, prepared_owner)
+            || state.resource_generation != Some(generation)
+            || state.write_slot != WriteSlotState::Live(actual)
+            || state.next_transaction_id != actual
+            || state.resource_profile()? != prepared_profile
+        {
+            return Err(NativeResourcePlanningRefusal::Stale);
+        }
+        Ok(())
+    }
+
+    fn require_resource_epoch(
+        &self,
+        state: &State,
+        epoch: &NativeResourceEpoch<'_>,
+    ) -> core::result::Result<(), NativeResourcePlanningRefusal> {
+        self.require_resource_parts(
+            state,
+            epoch.actual,
+            epoch.generation,
+            epoch.profile,
+            epoch.inspection_serial,
+        )
+    }
+
+    fn require_resource_parts(
+        &self,
+        state: &State,
+        actual: &TransactionTracker,
+        generation: u64,
+        profile: NativeTrackerProfile,
+        inspection_serial: Option<u64>,
+    ) -> core::result::Result<(), NativeResourcePlanningRefusal> {
+        if !core::ptr::eq(self, actual) {
+            return Err(NativeResourcePlanningRefusal::Stale);
+        }
+        let permitted = match inspection_serial {
+            None => state.write_slot == WriteSlotState::Free,
+            Some(serial) => state.write_slot == WriteSlotState::Inspecting(serial),
+        };
+        if !permitted {
+            return Err(NativeResourcePlanningRefusal::Busy);
+        }
+        let current = state
+            .resource_generation
+            .ok_or(NativeResourcePlanningRefusal::Exhausted)?;
+        if current != generation || state.resource_profile()? != profile {
+            return Err(NativeResourcePlanningRefusal::Stale);
+        }
+        Ok(())
+    }
+
+    // The actual Database factory must complete all pre-read/pre-construction
+    // admission first. This method atomically refuses a stale plan or returns
+    // the ordinary RAII write slot, with no wait, page read or allocation.
+    pub(crate) fn try_claim_resource_write_slot(
+        self: &Arc<Self>,
+        epoch: NativeResourceEpoch<'_>,
+    ) -> core::result::Result<crate::db::WriteSlot, NativeResourcePlanningRefusal> {
+        self.try_claim_fixed_resource_write_slot(&epoch)
+    }
+
+    pub(crate) fn try_claim_fixed_resource_write_slot(
+        self: &Arc<Self>,
+        epoch: &NativeResourceEpoch<'_>,
+    ) -> core::result::Result<crate::db::WriteSlot, NativeResourcePlanningRefusal> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| NativeResourcePlanningRefusal::Poisoned)?;
+        if epoch.inspection_serial.is_some() {
+            return Err(NativeResourcePlanningRefusal::Unsupported);
+        }
+        self.require_resource_epoch(&state, epoch)?;
+        let Some(next) = epoch.generation.checked_add(1) else {
+            state.resource_generation = None;
+            return Err(NativeResourcePlanningRefusal::Exhausted);
+        };
+        let claim = NativeResourceSlotClaim {
+            tracker: self.clone(),
+        };
+        state.resource_generation = Some(next);
+        state.write_slot = WriteSlotState::Initializing;
+        Ok(crate::db::WriteSlot::from_resource_claim(claim))
+    }
+
+    pub(crate) fn claim_system_inspection<'tracker>(
+        self: &Arc<Self>,
+        epoch: &NativeResourceEpoch<'tracker>,
+    ) -> core::result::Result<
+        (
+            crate::db::NativeSystemInspectionLease,
+            NativeResourceEpoch<'tracker>,
+        ),
+        NativeResourcePlanningRefusal,
+    > {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| NativeResourcePlanningRefusal::Poisoned)?;
+        if epoch.inspection_serial.is_some() {
+            return Err(NativeResourcePlanningRefusal::Unsupported);
+        }
+        self.require_resource_epoch(&state, epoch)?;
+        let serial = state
+            .next_inspection_serial
+            .ok_or(NativeResourcePlanningRefusal::Exhausted)?;
+        state.next_inspection_serial = serial.checked_add(1);
+        let private_epoch = NativeResourceEpoch {
+            actual: epoch.actual,
+            generation: epoch.generation,
+            profile: epoch.profile,
+            inspection_serial: Some(serial),
+        };
+        let claim = NativeSystemInspectionClaim {
+            tracker: self.clone(),
+            serial,
+        };
+        state.write_slot = WriteSlotState::Inspecting(serial);
+        drop(state); // Never hold the tracker mutex during page/backend work.
+        Ok((
+            crate::db::NativeSystemInspectionLease::from_claim(claim),
+            private_epoch,
+        ))
+    }
+
+    pub(crate) fn end_system_inspection(
+        &self,
+        claim: NativeSystemInspectionClaim,
+    ) -> Option<Arc<TransactionalMemory>> {
+        assert!(core::ptr::eq(self, claim.tracker.as_ref()));
+        let mut state = self.state.lock().unwrap();
+        assert_eq!(state.write_slot, WriteSlotState::Inspecting(claim.serial));
+        state.write_slot = WriteSlotState::Free;
+        self.live_write_transaction_available.notify_one();
+        state.deferred_close.take()
+    }
+
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn notify_inspection_wait_for_test(&self, sender: std::sync::mpsc::SyncSender<()>) {
+        let mut notification = self.inspection_wait_notification.lock().unwrap();
+        assert!(notification.is_none());
+        *notification = Some(sender);
+    }
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn exhaust_inspection_serial_for_test(&self) {
+        let mut state = self.state.lock().unwrap();
+        assert_eq!(state.write_slot, WriteSlotState::Free);
+        state.next_inspection_serial = None;
+    }
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn resource_scalars_for_test(&self) -> (Option<u64>, TransactionId) {
+        let state = self.state.lock().unwrap();
+        (state.resource_generation, state.next_transaction_id)
+    }
+
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn exhaust_resource_generation_for_test(&self) {
+        let mut state = self.state.lock().unwrap();
+        assert_eq!(state.write_slot, WriteSlotState::Free);
+        state.resource_generation = Some(u64::MAX);
     }
 
     // Issues the slot's transaction an id that follows `last_committed`, the id of the file's
@@ -331,8 +1060,26 @@ impl TransactionTracker {
         ));
         state.write_slot = WriteSlotState::Free;
         self.live_write_transaction_available.notify_one();
-
-        state.deferred_close.take()
+        #[cfg(not(redb_no_std))]
+        {
+            state.source_tail_preparation = None;
+        }
+        #[cfg(not(redb_no_std))]
+        let retired = if state.source_tail_preparation.is_none()
+            && state
+                .source_freed_markers
+                .as_ref()
+                .is_some_and(|markers| markers.len() == 0)
+        {
+            state.source_freed_markers.take()
+        } else {
+            None
+        };
+        let deferred_close = state.deferred_close.take();
+        drop(state);
+        #[cfg(not(redb_no_std))]
+        drop(retired);
+        deferred_close
     }
 
     // Defers the database close to the end of the live write transaction, if one exists.
@@ -352,17 +1099,38 @@ impl TransactionTracker {
         }
     }
 
+    // Scalar-only test observation. No collection or tracker authority escapes.
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn reclamation_quote_snapshot_for_test(&self) -> ReclamationTrackerSnapshot {
+        let state = self.state.lock().unwrap();
+        ReclamationTrackerSnapshot {
+            savepoints: state.valid_savepoints.len(),
+            persistent_savepoints: state.persistent_savepoints.len(),
+            pending: state.pending_count(),
+            first_pending: state.first_pending(),
+            unprocessed: state.unprocessed_count(),
+        }
+    }
+
     pub(crate) fn clear_pending_non_durable_commits(&self, memory: &TransactionalMemory) {
         let mut state = self.state.lock().unwrap();
         let ids = mem::take(&mut state.pending_non_durable_commits);
         for (_, durable_ancestor) in ids {
             state.remove_active_transaction_lock_reference(memory, durable_ancestor);
         }
+        #[cfg(not(redb_no_std))]
+        if let Some(tail) = state.source_pending_tail.take() {
+            if state.active_transaction_lock_references(tail.durable_ancestor) == 0 {
+                State::release_active_transaction_lock(memory, tail.durable_ancestor);
+            }
+        }
+        // Neither origin's unprocessed markers are cleared here: the existing
+        // extraction evidence, not durable publication, owns that transition.
     }
 
     pub(crate) fn is_unprocessed_non_durable_commit(&self, id: TransactionId) -> bool {
         let state = self.state.lock().unwrap();
-        state.unprocessed_freed_non_durable_commits.contains(&id)
+        state.unprocessed_contains(id)
     }
 
     pub(crate) fn mark_non_durable_freed_pages_processed(
@@ -372,16 +1140,40 @@ impl TransactionTracker {
         let mut state = self.state.lock().unwrap();
         for id in ids {
             state.unprocessed_freed_non_durable_commits.remove(&id);
+            #[cfg(not(redb_no_std))]
+            if let Some(markers) = state.source_freed_markers.as_mut() {
+                markers.remove(id);
+            }
         }
+        #[cfg(not(redb_no_std))]
+        let retired = if state.source_tail_preparation.is_none()
+            && state
+                .source_freed_markers
+                .as_ref()
+                .is_some_and(|markers| markers.len() == 0)
+        {
+            state.source_freed_markers.take()
+        } else {
+            None
+        };
+        drop(state);
+        // Logical removals retain their buffer guard. Only actual empty-owner
+        // retirement destroys the Vec before refund, outside the tracker lock.
+        #[cfg(not(redb_no_std))]
+        drop(retired);
     }
 
     pub(crate) fn oldest_unprocessed_non_durable_commit(&self) -> Option<TransactionId> {
         let state = self.state.lock().unwrap();
-        state
+        let ordinary = state
             .unprocessed_freed_non_durable_commits
             .iter()
             .next()
-            .copied()
+            .copied();
+        match (ordinary, state.source_unprocessed_first()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     // `has_unprocessed_freed_pages` is true when a future non-durable commit should scan
@@ -410,6 +1202,121 @@ impl TransactionTracker {
         Ok(())
     }
 
+    // Caller is the future closed Source Immediate constructor, deriving the
+    // actual guard/memory from its owning Database. No public tuple factory.
+    // No mutation, ID reservation, or pending reference is created here.
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn prepare_source_tail_markers(
+        &self,
+        memory: &TransactionalMemory,
+        guard: &crate::db::TransactionGuard,
+        resources: &crate::tree_store::NativePageResources,
+    ) -> Result {
+        if memory.concurrency_mode() != crate::db::ConcurrencyMode::ExclusiveWriter
+            || !resources.is_source_write()
+            || !guard.is_exclusive_writer_for(memory, self)
+        {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        let mut state = self.state.lock()?;
+        if state.write_slot != WriteSlotState::Live(guard.id())
+            || !state.valid_savepoints.is_empty()
+            || !state.persistent_savepoints.is_empty()
+            || !state.persistent_savepoint_references.is_empty()
+        {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        let generation = state
+            .resource_generation
+            .ok_or_else(crate::tree_store::source_owner_refused)?;
+        let replacement = crate::tree_store::NativeOwnedTransactionMarkers::prepare_replacement(
+            state.source_freed_markers.as_ref(),
+            resources,
+        )?;
+        let retired = state.source_freed_markers.replace(replacement);
+        state.source_tail_preparation = Some(SourceTailPreparationStamp {
+            actual_memory: core::ptr::from_ref(memory) as usize,
+            writer_id: guard.id(),
+            generation,
+        });
+        drop(state);
+        // Both buffers coexist under their own actual guards until this point.
+        drop(retired);
+        Ok(())
+    }
+
+    // Intentionally NOT wired into register_non_durable_commit or the Source
+    // test constructor. Actual Immediate/quick-repair/post-only recipe checks,
+    // prospective marker preparation and all owner coverage must join first.
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn register_source_post_tail(
+        &self,
+        memory: &TransactionalMemory,
+        guard: &crate::db::TransactionGuard,
+        id: TransactionId,
+        has_unprocessed_freed_pages: bool,
+    ) -> Result {
+        if memory.concurrency_mode() != crate::db::ConcurrencyMode::ExclusiveWriter
+            || !guard.is_exclusive_writer_for(memory, self)
+        {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        let header = memory.lock_header_shared()?;
+        let (actual_published, _) = memory.latest_committed_snapshot(&header)?;
+        let actual_durable = memory.get_last_durable_transaction_id()?;
+        let mut state = self.state.lock()?;
+        if state.write_slot != WriteSlotState::Live(guard.id())
+            || actual_published != id
+            || actual_durable != guard.id()
+            || !state.source_tail_preparation.is_some_and(|prepared| {
+                prepared.actual_memory == core::ptr::from_ref(memory) as usize
+                    && prepared.writer_id == guard.id()
+                    && state.resource_generation == Some(prepared.generation)
+            })
+            || state.next_transaction_id != id
+            || guard.id().raw_id().checked_add(1) != Some(id.raw_id())
+            || state.source_pending_tail.is_some()
+            || state.pending_contains(id)
+            || state.unprocessed_contains(id)
+            || !state.valid_savepoints.is_empty()
+            || !state.persistent_savepoints.is_empty()
+            || !state.persistent_savepoint_references.is_empty()
+            || (has_unprocessed_freed_pages
+                && !state
+                    .source_freed_markers
+                    .as_ref()
+                    .is_some_and(|markers| markers.has_spare()))
+        {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        // ExclusiveWriter's active-byte operation is a no-op. The exact
+        // ancestor reference still joins every local read/reclamation count.
+        state.source_pending_tail = Some(SourcePendingTail {
+            id,
+            durable_ancestor: guard.id(),
+        });
+        if has_unprocessed_freed_pages {
+            state
+                .source_freed_markers
+                .as_mut()
+                .expect("checked prepared marker owner")
+                .insert_prepared(id);
+        }
+        state.source_tail_preparation = None;
+        let retired = if state
+            .source_freed_markers
+            .as_ref()
+            .is_some_and(|markers| markers.len() == 0)
+        {
+            state.source_freed_markers.take()
+        } else {
+            None
+        };
+        drop(state);
+        drop(retired);
+        Ok(())
+    }
+
     // Reserve a transaction id that was created without starting a new write transaction.
     // The caller must still register the resulting root if it is a non-durable commit.
     pub(crate) fn reserve_transaction_id(
@@ -431,6 +1338,7 @@ impl TransactionTracker {
     pub(crate) fn reserve_repair_transaction_id(&self, id: TransactionId) {
         let mut state = self.state.lock().unwrap();
         assert_eq!(state.write_slot, WriteSlotState::Free);
+        state.advance_resource_generation();
         state.next_transaction_id = state.next_transaction_id.max(id);
     }
 
@@ -483,6 +1391,135 @@ impl TransactionTracker {
         state.convert_reference_to_persistent_savepoint(mem, transaction);
     }
 
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn capture_planned_read_snapshot<'owner>(
+        &'owner self,
+        mem: &'owner TransactionalMemory,
+    ) -> core::result::Result<NativePlannedReadSnapshot<'owner>, NativePlannedReadError> {
+        if mem.concurrency_mode() != crate::db::ConcurrencyMode::ExclusiveWriter {
+            return Err(NativePlannedReadError::Resource(
+                NativeResourcePlanningRefusal::Unsupported,
+            ));
+        }
+        // Same lock order and actual snapshot primitive as ordinary begin_read.
+        let header = mem.lock_header_shared()?;
+        let state = self.state.lock().map_err(StorageError::from)?;
+        if state.write_slot != WriteSlotState::Free || state.planned_read_slot.is_some() {
+            return Err(NativePlannedReadError::Resource(
+                NativeResourcePlanningRefusal::Busy,
+            ));
+        }
+        let generation = state
+            .resource_generation
+            .ok_or(NativePlannedReadError::Resource(
+                NativeResourcePlanningRefusal::Exhausted,
+            ))?;
+        if state.next_planned_read_serial.is_none() {
+            return Err(NativePlannedReadError::Resource(
+                NativeResourcePlanningRefusal::Exhausted,
+            ));
+        }
+        let (transaction_id, root) = mem.latest_committed_snapshot(&header)?;
+        Ok(NativePlannedReadSnapshot {
+            actual_tracker: self,
+            actual_memory: mem,
+            transaction_id,
+            root,
+            generation,
+        })
+    }
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn register_planned_read(
+        &self,
+        mem: &TransactionalMemory,
+        snapshot: &NativePlannedReadSnapshot<'_>,
+    ) -> core::result::Result<(TransactionId, Option<BtreeHeader>, u64), NativePlannedReadError>
+    {
+        if !core::ptr::eq(snapshot.actual_tracker, self)
+            || !core::ptr::eq(snapshot.actual_memory, mem)
+        {
+            return Err(NativePlannedReadError::Resource(
+                NativeResourcePlanningRefusal::Stale,
+            ));
+        }
+        if mem.concurrency_mode() != crate::db::ConcurrencyMode::ExclusiveWriter {
+            return Err(NativePlannedReadError::Resource(
+                NativeResourcePlanningRefusal::Unsupported,
+            ));
+        }
+        let header = mem.lock_header_shared()?;
+        let mut state = self.state.lock().map_err(StorageError::from)?;
+        if state.planned_read_slot.is_some() || state.write_slot != WriteSlotState::Free {
+            return Err(NativePlannedReadError::Resource(
+                NativeResourcePlanningRefusal::Busy,
+            ));
+        }
+        if state.resource_generation != Some(snapshot.generation) {
+            return Err(NativePlannedReadError::Resource(
+                NativeResourcePlanningRefusal::Stale,
+            ));
+        }
+        let (id, root) = mem.latest_committed_snapshot(&header)?;
+        if id != snapshot.transaction_id || root != snapshot.root {
+            return Err(NativePlannedReadError::Resource(
+                NativeResourcePlanningRefusal::Stale,
+            ));
+        }
+        let serial = state
+            .next_planned_read_serial
+            .ok_or(NativePlannedReadError::Resource(
+                NativeResourcePlanningRefusal::Exhausted,
+            ))?;
+        state.next_planned_read_serial = serial.checked_add(1);
+        state.planned_read_slot = Some(PlannedReadSlot {
+            transaction_id: id,
+            serial,
+            actual_memory: core::ptr::from_ref(mem) as usize,
+        });
+        // No BTreeMap node, OS lock-range entry or namespace allocation occurs.
+        Ok((id, root, serial))
+    }
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn require_planned_read_pin(
+        &self,
+        mem: &TransactionalMemory,
+        id: TransactionId,
+        serial: u64,
+    ) -> core::result::Result<(), NativeResourcePlanningRefusal> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| NativeResourcePlanningRefusal::Poisoned)?;
+        if !state.planned_read_slot.is_some_and(|slot| {
+            slot.transaction_id == id
+                && slot.serial == serial
+                && slot.actual_memory == core::ptr::from_ref(mem) as usize
+        }) {
+            return Err(NativeResourcePlanningRefusal::Stale);
+        }
+        Ok(())
+    }
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn deallocate_planned_read(
+        &self,
+        mem: &TransactionalMemory,
+        id: TransactionId,
+        serial: u64,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        let matches = state.planned_read_slot.is_some_and(|slot| {
+            slot.transaction_id == id
+                && slot.serial == serial
+                && slot.actual_memory == core::ptr::from_ref(mem) as usize
+        });
+        assert!(
+            matches,
+            "only the actual final planned read guard releases its slot"
+        );
+        state.planned_read_slot = None;
+        // ExclusiveWriter never announces active IDs through OS range locks.
+        // Ordinary map references at the same ID remain untouched.
+    }
     pub(crate) fn register_read_transaction(
         &self,
         mem: &TransactionalMemory,
@@ -524,6 +1561,9 @@ impl TransactionTracker {
     // non-durable commits.
     pub(crate) fn any_user_read_reference_exists(&self) -> bool {
         let state = self.state.lock().unwrap();
+        if state.planned_read_slot.is_some() {
+            return true;
+        }
         for (id, count) in &state.live_read_transactions {
             let pending_count = state
                 .pending_non_durable_commits
@@ -622,25 +1662,33 @@ impl TransactionTracker {
     }
 
     pub(crate) fn oldest_local_referenced_transaction(&self) -> Option<TransactionId> {
-        self.state
-            .lock()
-            .unwrap()
-            .live_read_transactions
-            .keys()
-            .next()
-            .copied()
+        self.state.lock().unwrap().oldest_read_reference()
     }
 
     // Returns the transaction id of the oldest non-durable transaction which has not been processed
     // for freeing, which has live read transactions
     pub(crate) fn oldest_live_read_nondurable_transaction(&self) -> Option<TransactionId> {
         let state = self.state.lock().unwrap();
-        for id in state.live_read_transactions.keys() {
-            if state.pending_non_durable_commits.contains_key(id) {
-                return Some(*id);
-            }
+        let ordinary = state
+            .live_read_transactions
+            .keys()
+            .find(|id| state.pending_contains(**id))
+            .copied();
+        let planned = state
+            .planned_read_slot
+            .map(|slot| slot.transaction_id)
+            .filter(|id| state.pending_contains(*id));
+        let user = match (ordinary, planned) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let source = state
+            .source_ancestor_reference()
+            .filter(|id| state.pending_contains(*id));
+        match (user, source) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
-        None
     }
 }
 

@@ -1,4 +1,6 @@
 use crate::sync::Mutex;
+use crate::tree_store::NativeOwnedPageVec;
+use crate::tree_store::NativeOwnedShared;
 use crate::tree_store::btree::{PagePath, UntypedBtree, UntypedBtreeMut};
 use crate::tree_store::multimap_btree::{UntypedMultiBtree, relocate_subtrees};
 use crate::tree_store::{
@@ -6,7 +8,6 @@ use crate::tree_store::{
 };
 use crate::{Key, Result, TableError, TypeName, Value};
 use alloc::string::ToString;
-use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -25,6 +26,13 @@ impl TableType {
     fn is_legacy(value: u8) -> bool {
         value == 1 || value == 2
     }
+    fn try_from_current_byte(value: u8) -> Option<Self> {
+        match value {
+            3 => Some(Self::Normal),
+            4 => Some(Self::Multimap),
+            _ => None,
+        }
+    }
 }
 
 #[allow(clippy::from_over_into)]
@@ -42,11 +50,7 @@ impl Into<u8> for TableType {
 
 impl From<u8> for TableType {
     fn from(value: u8) -> Self {
-        match value {
-            3 => TableType::Normal,
-            4 => TableType::Multimap,
-            _ => unreachable!(),
-        }
+        Self::try_from_current_byte(value).expect("Unknown native table type")
     }
 }
 
@@ -236,7 +240,7 @@ impl InternalTableDefinition {
     pub(crate) fn relocate_tree(
         &mut self,
         page_allocator: PageAllocator,
-        freed_pages: Arc<Mutex<Vec<PageNumber>>>,
+        freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
         relocation_map: &PageNumberHashMap<PageNumber>,
     ) -> Result<Option<BtreeHeader>> {
         let original_root = self.private_get_root();
@@ -351,6 +355,216 @@ impl InternalTableDefinition {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum NativeDefinitionResourceError {
+    Malformed,
+    Overflow,
+}
+
+struct BorrowedNativeDefinition<'bytes> {
+    table_type: TableType,
+    table_root: Option<BtreeHeader>,
+    table_length: u64,
+    fixed_key_size: Option<usize>,
+    fixed_value_size: Option<usize>,
+    key_alignment: usize,
+    value_alignment: usize,
+    key_type: &'bytes [u8],
+    value_type: &'bytes [u8],
+}
+struct NativeDefinitionReader<'bytes> {
+    remaining: &'bytes [u8],
+}
+impl<'bytes> NativeDefinitionReader<'bytes> {
+    fn take(
+        &mut self,
+        count: usize,
+    ) -> core::result::Result<&'bytes [u8], NativeDefinitionResourceError> {
+        let part = self
+            .remaining
+            .get(..count)
+            .ok_or(NativeDefinitionResourceError::Malformed)?;
+        self.remaining = &self.remaining[count..];
+        Ok(part)
+    }
+    fn bytes<const N: usize>(
+        &mut self,
+    ) -> core::result::Result<[u8; N], NativeDefinitionResourceError> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| NativeDefinitionResourceError::Malformed)
+    }
+    fn number(&mut self) -> core::result::Result<usize, NativeDefinitionResourceError> {
+        // Preserve the existing native decoder's u32-to-usize semantics.
+        Ok(u32::from_le_bytes(self.bytes()?) as usize)
+    }
+    fn optional_width(
+        &mut self,
+    ) -> core::result::Result<Option<usize>, NativeDefinitionResourceError> {
+        let non_null = self.bytes::<1>()?[0] != 0;
+        let width = self.number()?;
+        Ok(non_null.then_some(width))
+    }
+}
+impl InternalTableDefinition {
+    // ONE shared native field parser for the normal owned decoder and resource
+    // observation. No TypeName/String/Vec allocation precedes complete framing.
+    fn borrowed_native_parts(
+        data: &[u8],
+    ) -> core::result::Result<BorrowedNativeDefinition<'_>, NativeDefinitionResourceError> {
+        let mut reader = NativeDefinitionReader { remaining: data };
+        let tag = reader.bytes::<1>()?[0];
+        if TableType::is_legacy(tag) {
+            return Err(NativeDefinitionResourceError::Malformed);
+        }
+        let table_type = TableType::try_from_current_byte(tag)
+            .ok_or(NativeDefinitionResourceError::Malformed)?;
+        let table_length = u64::from_le_bytes(reader.bytes()?);
+        let non_null = reader.bytes::<1>()?[0] != 0;
+        let root = reader.bytes::<{ BtreeHeader::serialized_size() }>()?;
+        let table_root = if non_null {
+            Some(BtreeHeader::from_le_bytes(root))
+        } else {
+            None
+        };
+        let fixed_key_size = reader.optional_width()?;
+        let fixed_value_size = reader.optional_width()?;
+        let key_alignment = reader.number()?;
+        let value_alignment = reader.number()?;
+        let key_type_len = reader.number()?;
+        let key_type = reader.take(key_type_len)?;
+        let value_type = reader.remaining;
+        if !TypeName::valid_native_encoding(key_type)
+            || !TypeName::valid_native_encoding(value_type)
+        {
+            return Err(NativeDefinitionResourceError::Malformed);
+        }
+        Ok(BorrowedNativeDefinition {
+            table_type,
+            table_root,
+            table_length,
+            fixed_key_size,
+            fixed_value_size,
+            key_alignment,
+            value_alignment,
+            key_type,
+            value_type,
+        })
+    }
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn prepaid_decode_work_bytes(
+        data: &[u8],
+        name: &str,
+        expected_key: usize,
+        expected_value: usize,
+    ) -> crate::Result<usize> {
+        use crate::tree_store::page_store::{
+            point_vector_bytes as vector, source_owner_refused as refused,
+        };
+        let parsed = Self::borrowed_native_parts(data).map_err(|_| {
+            crate::StorageError::Corrupted("Malformed native table definition".to_string())
+        })?;
+        let key = TypeName::decoded_native_name_len(parsed.key_type).ok_or_else(refused)?;
+        let value = TypeName::decoded_native_name_len(parsed.value_type).ok_or_else(refused)?;
+        let mut bytes = 0u64;
+        // Actual definition's two owned names plus both check_match stored clones.
+        // Both expected names stay live during comparison; one additional expected
+        // name may be constructed in TypeDefinitionChanged before those locals drop.
+        for len in [
+            key,
+            value,
+            key,
+            value,
+            expected_key,
+            expected_value,
+            expected_key.max(expected_value),
+            name.len(),
+        ] {
+            bytes = bytes
+                .checked_add(vector::<u8>(len).map_err(|_| refused())?)
+                .ok_or_else(refused)?;
+        }
+        let u = usize::MAX.ilog10() as usize + 1;
+        let width = "Some("
+            .len()
+            .checked_add(u)
+            .and_then(|n| n.checked_add(")".len()))
+            .ok_or_else(refused)?;
+        let changed =
+            "Current definition of  does not match stored definition (width=, alignment=)"
+                .len()
+                .checked_add(key.max(value).max(expected_key).max(expected_value))
+                .and_then(|n| n.checked_add(width))
+                .and_then(|n| n.checked_add(u))
+                .ok_or_else(refused)?;
+        let mismatch = " is of type Table<, >"
+            .len()
+            .checked_add(name.len())
+            .and_then(|n| n.checked_add(key))
+            .and_then(|n| n.checked_add(value))
+            .ok_or_else(refused)?;
+        let kind = name
+            .len()
+            .checked_add(" is not a multimap table".len())
+            .ok_or_else(refused)?;
+        let output = "Unexpected TableError: "
+            .len()
+            .checked_add(changed.max(mismatch).max(kind))
+            .ok_or_else(refused)?;
+        // Conversion formats the original typed error while its names are still live.
+        bytes = bytes
+            .checked_add(crate::tree_store::page_store::native_cold_format_work_bytes(output)?)
+            .ok_or_else(refused)?;
+        usize::try_from(bytes).map_err(|_| refused())
+    }
+    pub(crate) fn native_resource_encoded_len<
+        K: Key + crate::types::NativeResourceTypeName,
+        V: Value + crate::types::NativeResourceTypeName,
+    >() -> core::result::Result<usize, NativeDefinitionResourceError> {
+        // SAME fixed-width fields as as_bytes below; root/length/option contents
+        // never alter the stored definition length (existing native invariant).
+        let fixed = 1
+            + size_of::<u64>()
+            + 1
+            + BtreeHeader::serialized_size()
+            + 2 * (1 + size_of::<u32>())
+            + 3 * size_of::<u32>();
+        let key = TypeName::native_resource_encoded_len::<K>()
+            .map_err(|_| NativeDefinitionResourceError::Overflow)?;
+        let value = TypeName::native_resource_encoded_len::<V>()
+            .map_err(|_| NativeDefinitionResourceError::Overflow)?;
+        u32::try_from(key).map_err(|_| NativeDefinitionResourceError::Overflow)?;
+        fixed
+            .checked_add(key)
+            .and_then(|n| n.checked_add(value))
+            .ok_or(NativeDefinitionResourceError::Overflow)
+    }
+    pub(crate) fn native_resource_matches<
+        K: Key + crate::types::NativeResourceTypeName,
+        V: Value + crate::types::NativeResourceTypeName,
+    >(
+        data: &[u8],
+    ) -> core::result::Result<bool, NativeDefinitionResourceError> {
+        let parsed = Self::borrowed_native_parts(data)?;
+        let name = |result| match result {
+            Ok(value) => Ok(value),
+            Err(crate::types::NativeResourceNameError::Malformed) => {
+                Err(NativeDefinitionResourceError::Malformed)
+            }
+            Err(crate::types::NativeResourceNameError::Overflow) => {
+                Err(NativeDefinitionResourceError::Overflow)
+            }
+        };
+        Ok(parsed.table_type == TableType::Normal
+            && parsed.fixed_key_size == K::fixed_width()
+            && parsed.fixed_value_size == V::fixed_width()
+            && parsed.key_alignment == ALIGNMENT
+            && parsed.value_alignment == ALIGNMENT
+            && name(TypeName::native_resource_matches::<K>(parsed.key_type))?
+            && name(TypeName::native_resource_matches::<V>(parsed.value_type))?)
+    }
+}
+
 impl Value for InternalTableDefinition {
     type SelfType<'a> = InternalTableDefinition;
     type AsBytes<'a> = Vec<u8>;
@@ -363,101 +577,27 @@ impl Value for InternalTableDefinition {
     where
         Self: 'a,
     {
-        debug_assert!(data.len() > 22);
-        let mut offset = 0;
-        let legacy = TableType::is_legacy(data[offset]);
-        assert!(!legacy);
-        let table_type = TableType::from(data[offset]);
-        offset += 1;
-
-        let table_length = u64::from_le_bytes(
-            data[offset..(offset + size_of::<u64>())]
-                .try_into()
-                .unwrap(),
-        );
-        offset += size_of::<u64>();
-
-        let non_null = data[offset] != 0;
-        offset += 1;
-        let table_root = if non_null {
-            Some(BtreeHeader::from_le_bytes(
-                data[offset..(offset + BtreeHeader::serialized_size())]
-                    .try_into()
-                    .unwrap(),
-            ))
-        } else {
-            None
-        };
-        offset += BtreeHeader::serialized_size();
-
-        let non_null = data[offset] != 0;
-        offset += 1;
-        let fixed_key_size = if non_null {
-            let fixed = u32::from_le_bytes(
-                data[offset..(offset + size_of::<u32>())]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            Some(fixed)
-        } else {
-            None
-        };
-        offset += size_of::<u32>();
-
-        let non_null = data[offset] != 0;
-        offset += 1;
-        let fixed_value_size = if non_null {
-            let fixed = u32::from_le_bytes(
-                data[offset..(offset + size_of::<u32>())]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            Some(fixed)
-        } else {
-            None
-        };
-        offset += size_of::<u32>();
-        let key_alignment = u32::from_le_bytes(
-            data[offset..(offset + size_of::<u32>())]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        offset += size_of::<u32>();
-        let value_alignment = u32::from_le_bytes(
-            data[offset..(offset + size_of::<u32>())]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        offset += size_of::<u32>();
-
-        let key_type_len = u32::from_le_bytes(
-            data[offset..(offset + size_of::<u32>())]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        offset += size_of::<u32>();
-        let key_type = TypeName::from_bytes(&data[offset..(offset + key_type_len)]);
-        offset += key_type_len;
-        let value_type = TypeName::from_bytes(&data[offset..]);
-
-        match table_type {
+        let parsed = Self::borrowed_native_parts(data).expect("Malformed native table definition");
+        let key_type = TypeName::from_bytes(parsed.key_type);
+        let value_type = TypeName::from_bytes(parsed.value_type);
+        match parsed.table_type {
             TableType::Normal => InternalTableDefinition::Normal {
-                table_root,
-                table_length,
-                fixed_key_size,
-                fixed_value_size,
-                key_alignment,
-                value_alignment,
+                table_root: parsed.table_root,
+                table_length: parsed.table_length,
+                fixed_key_size: parsed.fixed_key_size,
+                fixed_value_size: parsed.fixed_value_size,
+                key_alignment: parsed.key_alignment,
+                value_alignment: parsed.value_alignment,
                 key_type,
                 value_type,
             },
             TableType::Multimap => InternalTableDefinition::Multimap {
-                table_root,
-                table_length,
-                fixed_key_size,
-                fixed_value_size,
-                key_alignment,
-                value_alignment,
+                table_root: parsed.table_root,
+                table_length: parsed.table_length,
+                fixed_key_size: parsed.fixed_key_size,
+                fixed_value_size: parsed.fixed_value_size,
+                key_alignment: parsed.key_alignment,
+                value_alignment: parsed.value_alignment,
                 key_type,
                 value_type,
             },
@@ -517,3 +657,7 @@ impl Value for InternalTableDefinition {
         TypeName::internal("redb::InternalTableDefinition")
     }
 }
+
+#[cfg(all(test, not(redb_no_std)))]
+#[path = "native_definition_resource_tests.rs"]
+mod native_resource_tests;

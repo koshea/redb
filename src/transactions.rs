@@ -7,6 +7,7 @@ use crate::table::ReadOnlyUntypedTable;
 use crate::transaction_tracker::{
     LocalSavepointId, SavepointId, TransactionId, TransactionTracker,
 };
+use crate::tree_store::NativeOwnedShared;
 #[cfg(all(debug_assertions, not(redb_no_std)))]
 use crate::tree_store::PageNumberHashSet;
 use crate::tree_store::{
@@ -15,6 +16,7 @@ use crate::tree_store::{
     PageListMut, PageNumber, PageNumberHashMap, PageResolver, PageTracker, SerializedSavepoint,
     ShrinkPolicy, TableTree, TableTreeMut, TableType, TransactionalMemory,
 };
+use crate::tree_store::{NativeOwnedPageBatch, NativeOwnedPageVec};
 use crate::types::{Key, Value};
 use crate::{
     AccessGuard, AccessGuardMutInPlace, ExtractIf, MultimapTable, MultimapTableDefinition,
@@ -42,6 +44,57 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "logging")]
 use log::{debug, warn};
 
+#[path = "native_system_family_schema.rs"]
+mod native_system_family_schema;
+pub(crate) use native_system_family_schema::NativeSystemFamily;
+
+#[cfg(all(test, not(redb_no_std)))]
+#[path = "native_fixed_phase_witness.rs"]
+mod fixed_phase_witness;
+#[cfg(all(test, not(redb_no_std)))]
+pub(crate) use fixed_phase_witness::NativeFixedPhaseWitness;
+#[cfg(all(test, not(redb_no_std)))]
+#[derive(Clone, Copy)]
+pub(crate) enum NativeFixedPhaseFault {
+    BeforeMainAfterDataAppend,
+    AfterMainAfterPostExtraction,
+}
+
+#[path = "bounded_reclamation.rs"]
+mod bounded_reclamation;
+// Fixed empty native inspection fixture; no production budget constructor.
+#[cfg(all(test, not(redb_no_std)))]
+pub(crate) fn empty_reclamation_budget_for_native_test() -> bounded_reclamation::ReclamationBudget {
+    bounded_reclamation::ReclamationBudget::for_emitted_entries(0)
+}
+// Only a bounded actual-row census in the new native component fixture calls
+// this. The existing fixture equation remains unchanged, including any debt.
+#[cfg(all(test, not(redb_no_std)))]
+pub(crate) fn reclamation_budget_for_actual_prefix_fixture(
+    actual_records: usize,
+) -> bounded_reclamation::ReclamationBudget {
+    assert!(actual_records > 0 && actual_records <= 64);
+    bounded_reclamation::ReclamationBudget::for_emitted_entries(actual_records)
+}
+#[path = "native_system_resource_paths.rs"]
+mod native_system_resource_paths;
+#[cfg(not(redb_no_std))]
+pub(crate) use native_system_resource_paths::{NativeFreedAppendGapRecipe, NativeFreedPointRecipe};
+pub(crate) use native_system_resource_paths::{
+    NativeFreedBoundary, NativeFreedPathObserver, NativePreparedProfiledSystemResources,
+    NativePreparedReclamation, NativePreparedSystemResources, NativeSystemRead,
+};
+
+#[cfg(all(test, not(redb_no_std)))]
+#[path = "bounded_reclamation_quote.rs"]
+mod bounded_reclamation_quote;
+
+#[cfg(not(redb_no_std))]
+pub(crate) use native_system_resource_paths::{
+    NativeDetachedProfiledSystemResources, NativeFreedAppendPositions,
+    NativeSystemDetachmentFailure,
+};
+
 const MAX_PAGES_PER_COMPACTION: usize = 1_000_000;
 const NEXT_SAVEPOINT_TABLE: SystemTableDefinition<(), SavepointId> =
     SystemTableDefinition::new("next_savepoint_id");
@@ -68,6 +121,9 @@ pub(crate) type AllocatorStateTree = Btree<AllocatorStateKey, &'static [u8]>;
 pub(crate) type AllocatorStateTreeMut = BtreeMut<AllocatorStateKey, &'static [u8]>;
 pub(crate) type SystemFreedTree = BtreeMut<TransactionIdWithPagination, PageList<'static>>;
 
+const MAIN_PAGE_LIST_CHUNK: usize = 400;
+const SYSTEM_PAGE_LIST_CHUNK: usize = 200;
+
 // Format:
 // 2 bytes: length
 // length * size_of(PageNumber): array of page numbers
@@ -77,6 +133,33 @@ pub(crate) struct PageList<'a> {
 }
 
 impl PageList<'_> {
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn allocated_capacity_count() -> usize {
+        MAIN_PAGE_LIST_CHUNK
+    }
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn allocated_capacity_bytes() -> usize {
+        Self::required_bytes(MAIN_PAGE_LIST_CHUNK)
+    }
+
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn main_pagination_page_bytes_for_test(base_page: usize) -> usize {
+        let key = TransactionIdWithPagination::fixed_width().unwrap();
+        let value = Self::required_bytes(MAIN_PAGE_LIST_CHUNK);
+        let bytes =
+            crate::tree_store::RawLeafBuilder::required_bytes(1, key + value, Some(key), None);
+        bytes.div_ceil(base_page).next_power_of_two() * base_page
+    }
+
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn system_freed_capacity_count() -> usize {
+        SYSTEM_PAGE_LIST_CHUNK
+    }
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn system_freed_capacity_bytes() -> usize {
+        Self::required_bytes(SYSTEM_PAGE_LIST_CHUNK)
+    }
+
     fn required_bytes(len: usize) -> usize {
         2 + PageNumber::serialized_size() * len
     }
@@ -93,6 +176,10 @@ impl PageList<'_> {
                 .unwrap(),
         )
     }
+}
+
+impl crate::types::NativeResourceTypeName for PageList<'_> {
+    const INTERNAL_RESOURCE_NAME: &'static str = "redb::PageList";
 }
 
 impl Value for PageList<'_> {
@@ -124,7 +211,7 @@ impl Value for PageList<'_> {
     }
 
     fn type_name() -> TypeName {
-        TypeName::internal("redb::PageList")
+        TypeName::internal(<Self as crate::types::NativeResourceTypeName>::INTERNAL_RESOURCE_NAME)
     }
 }
 
@@ -146,6 +233,10 @@ impl MutInPlaceValue for PageList<'_> {
 pub(crate) struct TransactionIdWithPagination {
     pub(crate) transaction_id: u64,
     pub(crate) pagination_id: u64,
+}
+
+impl crate::types::NativeResourceTypeName for TransactionIdWithPagination {
+    const INTERNAL_RESOURCE_NAME: &'static str = "redb::TransactionIdWithPagination";
 }
 
 impl Value for TransactionIdWithPagination {
@@ -185,7 +276,7 @@ impl Value for TransactionIdWithPagination {
     }
 
     fn type_name() -> TypeName {
-        TypeName::internal("redb::TransactionIdWithPagination")
+        TypeName::internal(<Self as crate::types::NativeResourceTypeName>::INTERNAL_RESOURCE_NAME)
     }
 }
 
@@ -208,6 +299,10 @@ pub(crate) enum AllocatorStateKey {
     Region(u32),
     RegionTracker,
     TransactionId,
+}
+
+impl crate::types::NativeResourceTypeName for AllocatorStateKey {
+    const INTERNAL_RESOURCE_NAME: &'static str = "redb::AllocatorStateKey";
 }
 
 impl Value for AllocatorStateKey {
@@ -258,7 +353,7 @@ impl Value for AllocatorStateKey {
     }
 
     fn type_name() -> TypeName {
-        TypeName::internal("redb::AllocatorStateKey")
+        TypeName::internal(<Self as crate::types::NativeResourceTypeName>::INTERNAL_RESOURCE_NAME)
     }
 }
 
@@ -396,26 +491,30 @@ enum PostCommitFree {
 
 // Like a Table but only one may be open at a time to avoid possible races
 pub struct SystemTable<'s, K: Key + 'static, V: Value + 'static> {
-    name: String,
+    name: crate::tree_store::NativeTableName,
     namespace: &'s mut SystemNamespace,
     tree: BtreeMut<K, V>,
-    transaction_guard: Arc<TransactionGuard>,
+    transaction_guard: NativeOwnedShared<TransactionGuard>,
 }
 
 impl<'s, K: Key + 'static, V: Value + 'static> SystemTable<'s, K, V> {
     fn new(
         name: &str,
         table_root: Option<BtreeHeader>,
-        freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-        guard: Arc<TransactionGuard>,
+        freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+        guard: NativeOwnedShared<TransactionGuard>,
         page_allocator: PageAllocator,
         namespace: &'s mut SystemNamespace,
+        prepared_ignore: Option<NativeOwnedShared<PageTracker>>,
+        prepared_name: Option<crate::tree_store::NativeTableName>,
     ) -> SystemTable<'s, K, V> {
         // No need to track allocations in the system tree. Savepoint restoration only relies on
         // freeing in the data tree
-        let ignore = Arc::new(PageTracker::ignore());
+        let ignore =
+            prepared_ignore.unwrap_or_else(|| NativeOwnedShared::ordinary(PageTracker::ignore()));
         SystemTable {
-            name: name.to_string(),
+            name: prepared_name
+                .unwrap_or_else(|| crate::tree_store::NativeTableName::ordinary(name)),
             namespace,
             tree: BtreeMut::new(
                 table_root,
@@ -519,35 +618,56 @@ impl<K: Key + 'static, V: Value + 'static> Drop for SystemTable<'_, K, V> {
 }
 
 struct SystemNamespace {
+    table_names: crate::tree_store::NativeTxnNameMap<&'static panic::Location<'static>>,
     table_tree: TableTreeMut,
-    freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-    transaction_guard: Arc<TransactionGuard>,
+    freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+    transaction_guard: NativeOwnedShared<TransactionGuard>,
 }
 
 impl SystemNamespace {
     fn new(
         root_page: Option<BtreeHeader>,
-        guard: Arc<TransactionGuard>,
+        guard: NativeOwnedShared<TransactionGuard>,
         page_allocator: PageAllocator,
-    ) -> Self {
+        #[cfg(not(redb_no_std))] prepared: Option<NativePreparedNamespace>,
+    ) -> Result<Self> {
         // No need to track allocations in the system tree. Savepoint restoration only relies on
         // freeing in the data tree
-        let ignore = Arc::new(PageTracker::ignore());
-        let freed_pages = Arc::new(Mutex::new(vec![]));
-        Self {
-            table_tree: TableTreeMut::new(
-                root_page,
-                guard.clone(),
-                page_allocator,
-                freed_pages.clone(),
-                ignore,
-            ),
+        let ignore = page_allocator.new_shared(PageTracker::ignore())?;
+        #[cfg(not(redb_no_std))]
+        let (freed_pages, table_names, prepared_names) = if let Some(prepared) = prepared {
+            (prepared.freed, prepared.open, Some(prepared.pending))
+        } else {
+            (
+                page_allocator.new_shared(Mutex::new(NativeOwnedPageVec::default()))?,
+                crate::tree_store::NativeTxnNameMap::default(),
+                None,
+            )
+        };
+        #[cfg(redb_no_std)]
+        let freed_pages = page_allocator.new_shared(Mutex::new(NativeOwnedPageVec::default()))?;
+        #[cfg(redb_no_std)]
+        let table_names = crate::tree_store::NativeTxnNameMap::default();
+        let mut table_tree = TableTreeMut::new(
+            root_page,
+            guard.clone(),
+            page_allocator,
+            freed_pages.clone(),
+            ignore,
+        );
+        #[cfg(not(redb_no_std))]
+        if let Some(names) = prepared_names {
+            table_tree.install_prepared_pending_names(names);
+        }
+        Ok(Self {
+            table_names,
+            table_tree,
             freed_pages,
             transaction_guard: guard.clone(),
-        }
+        })
     }
 
-    fn system_freed_pages(&self) -> Arc<Mutex<Vec<PageNumber>>> {
+    fn system_freed_pages(&self) -> NativeOwnedShared<Mutex<NativeOwnedPageVec>> {
         self.freed_pages.clone()
     }
 
@@ -555,6 +675,11 @@ impl SystemNamespace {
         &'s mut self,
         definition: SystemTableDefinition<K, V>,
     ) -> Result<SystemTable<'s, K, V>> {
+        let page_allocator = self.table_tree.page_allocator().clone();
+        // Admit the Source control before get_or_create can change a namespace
+        // page. Ordinary Arc allocation stays in SystemTable::new as before.
+        let prepared_ignore = page_allocator.prepare_source_shared(PageTracker::ignore())?;
+        let prepared_name = self.table_names.source_name_for_handle(definition.name())?;
         let (root, _) = self
             .table_tree
             .get_or_create_table::<K, V>(definition.name(), TableType::Normal)
@@ -566,7 +691,6 @@ impl SystemNamespace {
         // Not marked dirty: savepoints capture only the data root, system trees roll forward
         // through restores, and system allocations are untracked (see SystemNamespace::new)
 
-        let page_allocator = self.table_tree.page_allocator().clone();
         Ok(SystemTable::new(
             definition.name(),
             root,
@@ -574,6 +698,8 @@ impl SystemNamespace {
             self.transaction_guard.clone(),
             page_allocator,
             self,
+            prepared_ignore,
+            prepared_name,
         ))
     }
 
@@ -605,21 +731,48 @@ impl SystemNamespace {
 }
 
 struct TableNamespace {
-    open_tables: BTreeMap<String, &'static panic::Location<'static>>,
-    allocated_pages: Arc<PageTracker>,
-    freed_pages: Arc<Mutex<Vec<PageNumber>>>,
+    open_tables: crate::tree_store::NativeTxnNameMap<&'static panic::Location<'static>>,
+    allocated_pages: NativeOwnedShared<PageTracker>,
+    freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
     table_tree: TableTreeMut,
 }
 
 impl TableNamespace {
     fn new(
         root_page: Option<BtreeHeader>,
-        guard: Arc<TransactionGuard>,
+        guard: NativeOwnedShared<TransactionGuard>,
         page_allocator: PageAllocator,
-    ) -> Self {
-        let allocated = Arc::new(PageTracker::new_tracking());
-        let freed_pages = Arc::new(Mutex::new(vec![]));
-        let table_tree = TableTreeMut::new(
+        #[cfg(not(redb_no_std))] checked_source_tracking: Option<
+            &crate::transaction_tracker::NativeSourceNoSavepointWriteProfile,
+        >,
+        #[cfg(not(redb_no_std))] prepared: Option<NativePreparedNamespace>,
+    ) -> Result<Self> {
+        #[cfg(not(redb_no_std))]
+        let policy = if checked_source_tracking.is_some() {
+            // Only a real checked fixed-executor constructor supplies this;
+            // generic Source contexts never select Ignore merely by existing.
+            PageTracker::ignore()
+        } else {
+            PageTracker::new_tracking()
+        };
+        #[cfg(redb_no_std)]
+        let policy = PageTracker::new_tracking();
+        let allocated = page_allocator.new_shared(policy)?;
+        #[cfg(not(redb_no_std))]
+        let (freed_pages, open_tables, prepared_names) = if let Some(prepared) = prepared {
+            (prepared.freed, prepared.open, Some(prepared.pending))
+        } else {
+            (
+                page_allocator.new_shared(Mutex::new(NativeOwnedPageVec::default()))?,
+                crate::tree_store::NativeTxnNameMap::default(),
+                None,
+            )
+        };
+        #[cfg(redb_no_std)]
+        let freed_pages = page_allocator.new_shared(Mutex::new(NativeOwnedPageVec::default()))?;
+        #[cfg(redb_no_std)]
+        let open_tables = crate::tree_store::NativeTxnNameMap::default();
+        let mut table_tree = TableTreeMut::new(
             root_page,
             guard,
             page_allocator,
@@ -628,12 +781,16 @@ impl TableNamespace {
             freed_pages.clone(),
             allocated.clone(),
         );
-        Self {
-            open_tables: BTreeMap::default(),
+        #[cfg(not(redb_no_std))]
+        if let Some(names) = prepared_names {
+            table_tree.install_prepared_pending_names(names);
+        }
+        Ok(Self {
+            open_tables,
             table_tree,
             freed_pages,
             allocated_pages: allocated,
-        }
+        })
     }
 
     fn set_dirty(&mut self, transaction: &WriteTransaction) {
@@ -660,12 +817,12 @@ impl TableNamespace {
             return Err(TableError::TableAlreadyOpen(name.to_string(), location));
         }
 
+        self.open_tables.require_name(name)?;
         let root = self
             .table_tree
             .get_or_create_table::<K, V>(name, table_type)?;
         self.table_tree.clear_pending_table_update(name);
-        self.open_tables
-            .insert(name.to_string(), panic::Location::caller());
+        self.open_tables.insert(name, panic::Location::caller());
 
         Ok(root)
     }
@@ -703,8 +860,8 @@ impl TableNamespace {
         let (root, _) = self.inner_open::<K, V>(definition.name(), TableType::Normal)?;
         self.set_dirty(transaction);
 
-        Ok(Table::new(
-            definition.name(),
+        Ok(Table::new_with_owned_name(
+            self.open_tables.name_for_handle(definition.name())?,
             root,
             self.freed_pages.clone(),
             self.allocated_pages.clone(),
@@ -929,7 +1086,7 @@ pub struct WriteTransaction {
     transaction_tracker: Arc<TransactionTracker>,
     mem: Arc<TransactionalMemory>,
     initial_layout: DatabaseLayout,
-    transaction_guard: Arc<TransactionGuard>,
+    transaction_guard: NativeOwnedShared<TransactionGuard>,
     transaction_id: TransactionId,
     tables: Mutex<TableNamespace>,
     system_tables: Mutex<SystemNamespace>,
@@ -941,6 +1098,17 @@ pub struct WriteTransaction {
     shrink_policy: ShrinkPolicy,
     quick_repair: bool,
     post_commit_free: PostCommitFree,
+    // None preserves legacy behavior. Only the future native planned-write
+    // constructor may install production limits after complete admission.
+    reclamation: Mutex<Option<bounded_reclamation::ReclamationBudget>>,
+    #[cfg(all(test, not(redb_no_std)))]
+    fixed_phase_resources: Option<crate::tree_store::NativePageResources>,
+    #[cfg(all(test, not(redb_no_std)))]
+    fixed_phase_witness: Option<NativeOwnedShared<Mutex<NativeFixedPhaseWitness>>>,
+    #[cfg(all(test, not(redb_no_std)))]
+    fixed_phase_fault: Option<NativeFixedPhaseFault>,
+    #[cfg(not(redb_no_std))]
+    checked_source_immediate: bool,
     // Set by a savepoint restore, to discard the in-memory freed-page records of the non-durable
     // commits it rolled back. Kept transaction-local so that an abort leaves them in place.
     restored_transaction: Option<TransactionId>,
@@ -949,23 +1117,425 @@ pub struct WriteTransaction {
     savepoint_state: Mutex<SavepointTransactionState>,
 }
 
+// Actual borrowed closed-writer profile. The native executor owns the writer;
+// this proof grants no write access and cannot survive that real writer.
+#[cfg(not(redb_no_std))]
+pub(crate) struct NativeFixedCommitProfile<'writer> {
+    actual: &'writer WriteTransaction,
+    admission: crate::tree_store::NativeFixedObservationAdmission,
+}
+#[cfg(not(redb_no_std))]
+impl NativeFixedCommitProfile<'_> {
+    pub(crate) fn require_current(&self) -> Result<()> {
+        self.admission.require_current()?;
+        self.actual.require_fixed_commit_profile_state()?;
+        self.admission.require_current()
+    }
+    pub(crate) fn require_append_positions(
+        &self,
+        data_main: &TransactionIdWithPagination,
+        system_post: &TransactionIdWithPagination,
+    ) -> Result<()> {
+        self.require_current()?;
+        let id = self.actual.transaction_id.raw_id();
+        let post = id
+            .checked_add(1)
+            .ok_or_else(crate::tree_store::source_owner_refused)?;
+        if data_main.transaction_id != id
+            || data_main.pagination_id != 0
+            || system_post.transaction_id != post
+        {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        self.require_current()
+    }
+}
+
 impl WriteTransaction {
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn point_trace_for_test(&self) -> Arc<crate::tree_store::NativePointMutatorTrace> {
+        self.page_allocator().install_point_trace()
+    }
+
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn data_freed_pages_for_point_test(&self) -> Vec<PageNumber> {
+        let tables = self.tables.lock().unwrap();
+        let pages = tables.freed_pages.lock().unwrap().clone();
+        pages
+    }
+
     pub(crate) fn new(
         guard: TransactionGuard,
         transaction_tracker: Arc<TransactionTracker>,
         mem: Arc<TransactionalMemory>,
         allocation_policy: AllocationPolicy,
     ) -> Result<Self> {
+        Self::new_with_context(
+            guard,
+            transaction_tracker,
+            mem,
+            allocation_policy,
+            #[cfg(not(redb_no_std))]
+            None,
+            #[cfg(not(redb_no_std))]
+            None,
+            #[cfg(not(redb_no_std))]
+            None,
+            #[cfg(not(redb_no_std))]
+            None,
+            #[cfg(not(redb_no_std))]
+            None,
+        )
+    }
+
+    // Exact five shared controls allocated by the genuine generic test writer:
+    // one actual guard, DATA/SYSTEM PageTrackers, DATA/SYSTEM freed owners.
+    // Their variable backing/full native factory is NOT quoted by this helper.
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn point_payload_shared_controls_for_test() -> Result<usize> {
+        let guard = NativeOwnedShared::<TransactionGuard>::source_capacity_bytes()?;
+        let trackers = NativeOwnedShared::<PageTracker>::source_capacity_bytes()?
+            .checked_mul(2)
+            .ok_or_else(crate::tree_store::source_owner_refused)?;
+        let freed = NativeOwnedShared::<Mutex<NativeOwnedPageVec>>::source_capacity_bytes()?
+            .checked_mul(2)
+            .ok_or_else(crate::tree_store::source_owner_refused)?;
+        guard
+            .checked_add(trackers)
+            .and_then(|bytes| bytes.checked_add(freed))
+            .ok_or_else(crate::tree_store::source_owner_refused)
+    }
+
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn new_for_point_payload_test(
+        guard: TransactionGuard,
+        transaction_tracker: Arc<TransactionTracker>,
+        mem: Arc<TransactionalMemory>,
+        context: crate::tree_store::NativeReadContext,
+        total_requests: usize,
+    ) -> Result<Self> {
+        Self::new_with_context(
+            guard,
+            transaction_tracker,
+            mem,
+            AllocationPolicy::Default,
+            Some((context, total_requests)),
+            None,
+            None,
+            None,
+            #[cfg(not(redb_no_std))]
+            None,
+        )
+    }
+
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn quarantine_fixed_local_for_fixture(&self, page: PageNumber) -> Result<()> {
+        if !self.checked_source_immediate {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        let tables = self.tables.lock()?;
+        let original = tables.freed_pages.lock()?;
+        let mut local = crate::tree_store::NativeLocalPageVec::default();
+        tables
+            .table_tree
+            .page_allocator()
+            .prepare_local_freed(&original, &mut local)?;
+        local.push(page);
+        // Simulate an abnormal undrained local owner. The production Drop path
+        // must quarantine it, and real precommit must reject/abort this writer.
+        drop(local);
+        Ok(())
+    }
+
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn fixed_commit_profile_capture_control_bytes() -> usize {
+        // Component frame/control overlap only; the whole writer stack and
+        // changed-forest/checksum peak remain separate required joins.
+        core::mem::size_of::<(
+            NativeFixedCommitProfile<'static>,
+            Result<NativeFixedCommitProfile<'static>>,
+            crate::tree_store::NativeFixedObservationAdmission,
+            crate::transaction_tracker::NativeSourceNoSavepointWriteProfile,
+            PageAllocator,
+            PageResolver,
+            crate::sync::MutexGuard<'static, TableNamespace>,
+            crate::sync::MutexGuard<'static, Option<bounded_reclamation::ReclamationBudget>>,
+            TransactionIdWithPagination,
+            TransactionIdWithPagination,
+            u64,
+            u64,
+            bool,
+            Result<()>,
+        )>()
+    }
+    #[cfg(not(redb_no_std))]
+    fn require_fixed_commit_profile_state(&self) -> Result<()> {
+        if !self.checked_source_immediate
+            || self.completed
+            || self.is_poisoned()
+            || self.durability != InternalDurability::Immediate
+            || self.quick_repair
+            || self.post_commit_free != PostCommitFree::Enabled
+            || self.restored_transaction.is_some()
+            || self.mem.concurrency_mode() != ConcurrencyMode::ExclusiveWriter
+        {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        self.mem.check_io_errors()?;
+        let _actual_profile = self
+            .transaction_tracker
+            .check_source_no_savepoint_writer(&self.mem, &self.transaction_guard)?;
+        // CheckedSource is installed only by the early Ignore constructor; the
+        // closed executor exposes no savepoint/setter/restore/table escape.
+        // This actual output check also rules out accidental tracked DATA debt.
+        if !self.tables.lock()?.allocated_pages.is_empty() {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        if !self
+            .reclamation
+            .lock()?
+            .as_ref()
+            .is_some_and(|budget| budget.allocated.is_some())
+        {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        Ok(())
+    }
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn capture_fixed_commit_profile(&self) -> Result<NativeFixedCommitProfile<'_>> {
+        // All fixed controls were admitted by NativePreparedFixedCleanup before
+        // writer claim. This takes only existing closed strong references.
+        let admission = self
+            .page_allocator()
+            .resolver()
+            .seal_fixed_observation_admission()?;
+        let profile = NativeFixedCommitProfile {
+            actual: self,
+            admission,
+        };
+        profile.require_current()?;
+        Ok(profile)
+    }
+
+    // Only the closed fixed executor calls this before consuming commit. No
+    // pool/native handle, scalar grant or ordinary-path quota dependency escapes.
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn require_fixed_local_integrity(&self) -> Result<()> {
+        if !self.checked_source_immediate {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        {
+            let tables = self.tables.lock()?;
+            tables.freed_pages.lock()?.require_fixed_local_integrity()?;
+        }
+        {
+            let system = self.system_tables.lock()?;
+            system.freed_pages.lock()?.require_fixed_local_integrity()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn install_fixed_phase_fault_for_fixture(&mut self, fault: NativeFixedPhaseFault) {
+        assert!(self.checked_source_immediate);
+        self.fixed_phase_fault = Some(fault);
+    }
+    #[cfg(all(test, not(redb_no_std)))]
+    fn fixed_phase_error_for_fixture(&self, code: u8) -> StorageError {
+        self.fixed_phase_resources
+            .as_ref()
+            .expect("actual fixed counter")
+            .record_fixed_phase_fault_for_test(code);
+        StorageError::Io(std::io::Error::from(std::io::ErrorKind::Interrupted))
+    }
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn observe_fixed_phases_for_test(
+        &mut self,
+        resources: crate::tree_store::NativePageResources,
+    ) {
+        assert!(self.checked_source_immediate);
+        self.fixed_phase_resources = Some(resources);
+    }
+    #[cfg(all(test, not(redb_no_std)))]
+    fn record_fixed_phase_for_test(
+        &self,
+        phase: usize,
+        budget: &bounded_reclamation::ReclamationBudget,
+        current: TransactionId,
+        removed: usize,
+    ) {
+        if let Some(resources) = &self.fixed_phase_resources {
+            resources.record_fixed_phase_for_test(
+                phase,
+                budget as *const _ as usize,
+                budget.fixed_phase_for_test(current, removed, self.transaction_id),
+            );
+        }
+    }
+
+    // Inactive until the complete native fixed executor owns this result in
+    // fields-private custody. No public/raw Source writer factory may call it.
+    // That executor exposes only fixed point operations and consuming commit,
+    // never savepoint/configuration methods, Deref or a raw transaction getter.
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn new_for_checked_source_immediate(
+        guard: TransactionGuard,
+        transaction_tracker: Arc<TransactionTracker>,
+        mem: Arc<TransactionalMemory>,
+        context: crate::tree_store::NativeReadContext,
+        total_requests: usize,
+        prepared_debug: crate::tree_store::NativePreparedDebugFamilies,
+        execution_buffers: crate::db::NativeFixedExecutionBuffers,
+        prepared_metadata: NativePreparedTxnMetadata<'_>,
+        reclamation: bounded_reclamation::ReclamationBudget,
+    ) -> Result<Self> {
+        if !context.resources.is_source_write() {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        let profile = transaction_tracker.check_source_no_savepoint_writer(&mem, &guard)?;
+        prepared_debug.require_for(&mem, &transaction_tracker, &guard, &context.resources)?;
+        execution_buffers.require_available(&context.resources)?;
+        prepared_metadata.require_with_reclamation(&mem, &context.resources, &reclamation)?;
+        Self::new_with_context(
+            guard,
+            transaction_tracker,
+            mem,
+            AllocationPolicy::Default,
+            Some((context, total_requests)),
+            Some(profile),
+            Some(execution_buffers),
+            Some(prepared_metadata),
+            Some(reclamation),
+        )
+    }
+
+    fn new_with_context(
+        guard: TransactionGuard,
+        transaction_tracker: Arc<TransactionTracker>,
+        mem: Arc<TransactionalMemory>,
+        allocation_policy: AllocationPolicy,
+        #[cfg(not(redb_no_std))] source_context: Option<(
+            crate::tree_store::NativeReadContext,
+            usize,
+        )>,
+        #[cfg(not(redb_no_std))] checked_source_tracking: Option<
+            crate::transaction_tracker::NativeSourceNoSavepointWriteProfile,
+        >,
+        #[cfg(not(redb_no_std))] execution_buffers: Option<crate::db::NativeFixedExecutionBuffers>,
+        #[cfg(not(redb_no_std))] prepared_metadata: Option<NativePreparedTxnMetadata<'_>>,
+        #[cfg(not(redb_no_std))] mut prepared_reclamation: Option<
+            bounded_reclamation::ReclamationBudget,
+        >,
+    ) -> Result<Self> {
+        #[cfg(not(redb_no_std))]
+        let require_prepared_debug = checked_source_tracking.is_some();
+        #[cfg(not(redb_no_std))]
+        if let Some(profile) = &checked_source_tracking {
+            if !source_context
+                .as_ref()
+                .is_some_and(|(context, _)| context.resources.is_source_write())
+            {
+                return Err(crate::tree_store::source_owner_refused());
+            }
+            profile.require_for(&transaction_tracker, &mem, &guard)?;
+            let prepared = prepared_metadata
+                .as_ref()
+                .ok_or_else(crate::tree_store::source_owner_refused)?;
+            let (context, _) = source_context
+                .as_ref()
+                .ok_or_else(crate::tree_store::source_owner_refused)?;
+            prepared.require_with_reclamation(
+                &mem,
+                &context.resources,
+                prepared_reclamation
+                    .as_ref()
+                    .ok_or_else(crate::tree_store::source_owner_refused)?,
+            )?;
+        }
+        #[cfg(not(redb_no_std))]
+        if checked_source_tracking.is_some() && prepared_reclamation.is_none() {
+            return Err(crate::tree_store::source_owner_refused());
+        }
+        // A real ordinary writer converts leftover Source-owned cache metadata
+        // before namespace construction or any table aliases can escape. After
+        // this point ordinary parallel tables retain their original cache path.
+        #[cfg(not(redb_no_std))]
+        if source_context.is_none() {
+            mem.prepare_ordinary_writer_cache(&transaction_tracker, &guard)?;
+        }
         let transaction_id = guard.id();
-        let guard = Arc::new(guard);
+        #[cfg(not(redb_no_std))]
+        let guard = if let Some((context, _)) = source_context.as_ref() {
+            NativeOwnedShared::source(guard, &context.resources)?
+        } else {
+            NativeOwnedShared::ordinary(guard)
+        };
+        #[cfg(redb_no_std)]
+        let guard = NativeOwnedShared::ordinary(guard);
 
         let root_page = mem.get_data_root();
         let system_page = mem.get_system_root();
 
         let initial_layout = mem.get_layout();
+        #[cfg(not(redb_no_std))]
+        let (data_metadata, system_metadata) = match prepared_metadata {
+            Some(mut prepared) => {
+                let (context, _) = source_context
+                    .as_ref()
+                    .ok_or_else(crate::tree_store::source_owner_refused)?;
+                let budget = prepared_reclamation
+                    .as_mut()
+                    .ok_or_else(crate::tree_store::source_owner_refused)?;
+                prepared.move_completed_into(&mem, &context.resources, budget)?;
+                (Some(prepared.data), Some(prepared.system))
+            }
+            None => (None, None),
+        };
+        #[cfg(not(redb_no_std))]
+        let page_allocator = if let Some((context, requests)) = source_context {
+            let allocator = PageAllocator::with_source_context(
+                mem.clone(),
+                allocation_policy,
+                context,
+                requests,
+            )?;
+            if require_prepared_debug {
+                let prepared =
+                    execution_buffers.ok_or_else(crate::tree_store::source_owner_refused)?;
+                allocator
+                    .with_prepared_checksums(
+                        prepared.checksum,
+                        prepared.sparse,
+                        prepared.cursor,
+                        prepared.packing,
+                        prepared.branch_children,
+                        prepared.branch_keys,
+                    )?
+                    .requiring_prepared_debug()
+            } else {
+                allocator
+            }
+        } else {
+            PageAllocator::new(mem.clone(), allocation_policy)
+        };
+        #[cfg(redb_no_std)]
         let page_allocator = PageAllocator::new(mem.clone(), allocation_policy);
-        let tables = TableNamespace::new(root_page, guard.clone(), page_allocator.clone());
-        let system_tables = SystemNamespace::new(system_page, guard.clone(), page_allocator);
+        let tables = TableNamespace::new(
+            root_page,
+            guard.clone(),
+            page_allocator.clone(),
+            #[cfg(not(redb_no_std))]
+            checked_source_tracking.as_ref(),
+            #[cfg(not(redb_no_std))]
+            data_metadata,
+        )?;
+        let system_tables = SystemNamespace::new(
+            system_page,
+            guard.clone(),
+            page_allocator,
+            #[cfg(not(redb_no_std))]
+            system_metadata,
+        )?;
 
         Ok(Self {
             transaction_tracker,
@@ -984,6 +1554,24 @@ impl WriteTransaction {
             // keeps on there
             quick_repair: mem.concurrency_mode() == ConcurrencyMode::MultiWriter,
             post_commit_free: PostCommitFree::Enabled,
+            reclamation: Mutex::new({
+                #[cfg(not(redb_no_std))]
+                {
+                    prepared_reclamation
+                }
+                #[cfg(redb_no_std)]
+                {
+                    None
+                }
+            }),
+            #[cfg(not(redb_no_std))]
+            checked_source_immediate: checked_source_tracking.is_some(),
+            #[cfg(all(test, not(redb_no_std)))]
+            fixed_phase_resources: None,
+            #[cfg(all(test, not(redb_no_std)))]
+            fixed_phase_witness: None,
+            #[cfg(all(test, not(redb_no_std)))]
+            fixed_phase_fault: None,
             restored_transaction: None,
             shrink_policy: ShrinkPolicy::Default,
             savepoint_state: Mutex::new(SavepointTransactionState::default()),
@@ -1027,7 +1615,7 @@ impl WriteTransaction {
             Some(root),
             PageHint::None,
             self.transaction_guard.clone(),
-            PageResolver::new(self.mem.clone()),
+            system_tables.table_tree.page_allocator().resolver(),
         )?;
         read(&table).map(Some)
     }
@@ -1193,7 +1781,7 @@ impl WriteTransaction {
         Ok(savepoint.get_id().0)
     }
 
-    pub(crate) fn transaction_guard(&self) -> Arc<TransactionGuard> {
+    pub(crate) fn transaction_guard(&self) -> NativeOwnedShared<TransactionGuard> {
         self.transaction_guard.clone()
     }
 
@@ -1608,6 +2196,35 @@ impl WriteTransaction {
         self.post_commit_free = PostCommitFree::Disabled;
     }
 
+    // Intentionally malformed historical metadata fixture: a genuine ordinary
+    // writer installs an otherwise well-formed padded DATA row at its actual
+    // next native ID. This proves the closed Source capture refuses collision;
+    // it grants no production ability to supply/adopt a native transaction ID.
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn seed_fixed_data_main_collision_for_fixture(&mut self) -> u64 {
+        self.set_finite_reclamation_for_test(0);
+        self.disable_post_commit_free();
+        let transaction_id = self.transaction_id.raw_id().checked_add(1).unwrap();
+        let key = TransactionIdWithPagination {
+            transaction_id,
+            pagination_id: 0,
+        };
+        let mut namespace = self.system_tables.lock().unwrap();
+        let mut table = namespace.open_system_table(DATA_FREED_TABLE).unwrap();
+        let mut value = table
+            .insert_reserve(&key, PageList::required_bytes(400))
+            .unwrap();
+        value.as_mut().clear();
+        transaction_id
+    }
+
+    #[cfg(test)]
+    fn set_finite_reclamation_for_test(&mut self, entries: usize) {
+        *self.reclamation.lock().unwrap() = Some(
+            bounded_reclamation::ReclamationBudget::for_emitted_entries(entries),
+        );
+    }
+
     /// Open the given table
     ///
     /// The table will be created if it does not exist
@@ -1784,6 +2401,19 @@ impl WriteTransaction {
         &mut self,
         header_lock: Option<&HeaderGuard<'_>>,
     ) -> Result<(), CommitError> {
+        #[cfg(not(redb_no_std))]
+        if let Some(prefix) = self
+            .reclamation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|budget| budget.allocated.as_ref())
+        {
+            // The private bounded consumer supports only the checked native
+            // Immediate/no-savepoint/post-only profile. Recheck BEFORE root
+            // flush, epilogue adoption, or any durable commit side effect.
+            prefix.require_before_flush(self)?;
+        }
         // Quick-repair requires 2-phase commit
         if self.quick_repair {
             self.two_phase_commit = true;
@@ -1804,12 +2434,26 @@ impl WriteTransaction {
         let (user_root, allocated_pages, data_freed) =
             self.tables.lock().unwrap().table_tree.flush_and_close()?;
 
+        #[cfg(not(redb_no_std))]
+        if self
+            .reclamation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|budget| budget.allocated.is_some())
+            && !allocated_pages.is_empty()
+        {
+            // The closed fixed writer must select Ignore BEFORE table creation
+            // under its actual profile. Empty current tracking is checked here,
+            // never inferred from a Source context or from PN allocation count.
+            return Err(crate::tree_store::source_owner_refused().into());
+        }
+
         // From here a durable commit is irreversible: it either completes or leaves the allocator
         // state invalidated, so nothing rolls back what it claims. That is what lets it take over
         // the epilogue's pages, which no durable root names and it is about to supersede.
         if self.durability == InternalDurability::Immediate {
-            let pages = self.mem.take_post_commit_allocations();
-            self.page_allocator().adopt_unpersisted(pages);
+            self.page_allocator().adopt_post_commit_allocations()?;
         }
 
         // A non-durable commit keeps its freed-page records in memory rather than writing them to
@@ -1819,18 +2463,29 @@ impl WriteTransaction {
             InternalDurability::None => {
                 let stored_pages = !data_freed.is_empty();
                 self.mem
-                    .record_unpersisted_data_freed(self.transaction_id, data_freed);
+                    .record_unpersisted_data_freed(self.transaction_id, data_freed)?;
                 stored_pages
             }
             InternalDurability::Immediate => self.store_data_freed_pages(data_freed)?,
         };
 
+        #[cfg(all(test, not(redb_no_std)))]
+        if stored_data_freed_pages
+            && matches!(
+                self.fixed_phase_fault,
+                Some(NativeFixedPhaseFault::BeforeMainAfterDataAppend)
+            )
+        {
+            // Actual SYS mutation completed. Native commit has already crossed
+            // its existing irreversible adoption/latch boundary: NO rollback.
+            return Err(self.fixed_phase_error_for_fixture(1).into());
+        }
         #[cfg(feature = "logging")]
         debug!(
             "Committing transaction id={:?} with durability={:?} two_phase={} quick_repair={}",
             self.transaction_id, self.durability, self.two_phase_commit, self.quick_repair
         );
-        let allocated_pages: Vec<PageNumber> = allocated_pages.into_iter().collect();
+        let allocated_pages = NativeOwnedPageBatch::ordinary(allocated_pages).into_prepared_vec();
         match self.durability {
             InternalDurability::None => {
                 self.non_durable_commit(user_root, allocated_pages, stored_data_freed_pages)?;
@@ -1876,7 +2531,7 @@ impl WriteTransaction {
             .apply_on_commit(&self.transaction_tracker);
     }
 
-    fn store_data_freed_pages(&self, freed_pages: Vec<PageNumber>) -> Result<bool> {
+    fn store_data_freed_pages(&self, freed_pages: NativeOwnedPageVec) -> Result<bool> {
         let stored_pages = !freed_pages.is_empty();
         // Open the table even when there is nothing to store: creating it lazily later would put
         // its metadata pages outside the baseline state that the initial cleanup commit captures.
@@ -1887,7 +2542,7 @@ impl WriteTransaction {
     fn store_data_freed_pages_for(
         &self,
         transaction_id: TransactionId,
-        mut freed_pages: Vec<PageNumber>,
+        mut freed_pages: NativeOwnedPageVec,
     ) -> Result {
         let mut system_tables = self.system_tables.lock().unwrap();
         let mut freed_table = system_tables.open_system_table(DATA_FREED_TABLE)?;
@@ -1895,7 +2550,7 @@ impl WriteTransaction {
         #[cfg(debug_assertions)]
         let page_allocator = self.page_allocator();
         while !freed_pages.is_empty() {
-            let chunk_size = 400;
+            let chunk_size = MAIN_PAGE_LIST_CHUNK;
             let buffer_size = PageList::required_bytes(chunk_size);
             let key = TransactionIdWithPagination {
                 transaction_id: transaction_id.raw_id(),
@@ -1934,7 +2589,7 @@ impl WriteTransaction {
     // savepoint survives this commit). `process_data_freed_pages_after_commit()` clamps its free
     // horizon to this value so that a savepoint dropped concurrently after the purge cannot cause
     // the epilogue to free a page that a surviving DATA_ALLOCATED_TABLE entry still names.
-    fn flush_data_allocated_pages(&self, data_allocated_pages: Vec<PageNumber>) -> Result<u64> {
+    fn flush_data_allocated_pages(&self, data_allocated_pages: NativeOwnedPageVec) -> Result<u64> {
         // Catch scenarios like a page getting allocated and then deallocated within the same
         // transaction, but errantly left in the allocated pages list.
         #[cfg(debug_assertions)]
@@ -1952,14 +2607,30 @@ impl WriteTransaction {
             }
         }
 
+        #[cfg(not(redb_no_std))]
+        let mut reclamation = self.reclamation.lock().unwrap();
+        #[cfg(not(redb_no_std))]
+        if let Some(prefix) = reclamation
+            .as_mut()
+            .and_then(|budget| budget.allocated.as_mut())
+        {
+            prefix.require_before_flush(self)?;
+        }
         let unpersisted = self.mem.take_unpersisted_allocations();
         let mut system_tables = self.system_tables.lock().unwrap();
+        #[cfg(not(redb_no_std))]
+        if let Some(prefix) = reclamation
+            .as_ref()
+            .and_then(|budget| budget.allocated.as_ref())
+        {
+            prefix.require_root(system_tables.get_system_table_root(DATA_ALLOCATED_TABLE)?)?;
+        }
         let mut allocated_table = system_tables.open_system_table(DATA_ALLOCATED_TABLE)?;
         for (txn_id, pages) in unpersisted {
             Self::write_allocated_pages_entry(
                 &mut allocated_table,
                 txn_id,
-                pages.into_iter().collect(),
+                pages.into_prepared_vec(),
             )?;
         }
         Self::write_allocated_pages_entry(
@@ -1967,6 +2638,16 @@ impl WriteTransaction {
             self.transaction_id,
             data_allocated_pages,
         )?;
+
+        #[cfg(not(redb_no_std))]
+        if let Some(prefix) = reclamation
+            .as_mut()
+            .and_then(|budget| budget.allocated.as_mut())
+        {
+            // No page in a stored allocation list is freed here. Only the
+            // exact admitted historical typed rows are removed.
+            return prefix.remove_from(&mut allocated_table);
+        }
 
         // Purge any transactions that are no longer referenced. The horizon must reflect the
         // savepoints that will exist after this commit: savepoints deleted in this transaction
@@ -1992,11 +2673,11 @@ impl WriteTransaction {
     fn write_allocated_pages_entry(
         allocated_table: &mut SystemTable<'_, TransactionIdWithPagination, PageList<'static>>,
         transaction_id: TransactionId,
-        mut pages: Vec<PageNumber>,
+        mut pages: NativeOwnedPageVec,
     ) -> Result {
         let mut pagination_counter = 0;
         while !pages.is_empty() {
-            let chunk_size = 400;
+            let chunk_size = MAIN_PAGE_LIST_CHUNK;
             let buffer_size = PageList::required_bytes(chunk_size);
             let key = TransactionIdWithPagination {
                 transaction_id: transaction_id.raw_id(),
@@ -2063,13 +2744,25 @@ impl WriteTransaction {
     pub(crate) fn durable_commit(
         &mut self,
         user_root: Option<BtreeHeader>,
-        allocated_pages: Vec<PageNumber>,
+        allocated_pages: NativeOwnedPageVec,
         header_lock: Option<&HeaderGuard<'_>>,
     ) -> Result {
+        #[cfg(not(redb_no_std))]
+        if let Some(prefix) = self
+            .reclamation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|budget| budget.allocated.as_ref())
+        {
+            // Eligibility is rechecked before ANY commit mutation or ownership
+            // transfer, including inherited volatile DATA and savepoint state.
+            prefix.require_before_flush(self)?;
+        }
         // Write out the freed-page records that earlier non-durable commits kept in memory, so
         // that they survive from here on like any other durable record.
         for (transaction_id, pages) in self.mem.take_unpersisted_data_freed() {
-            self.store_data_freed_pages_for(transaction_id, pages)?;
+            self.store_data_freed_pages_for(transaction_id, NativeOwnedPageVec::ordinary(pages))?;
         }
 
         let free_until_transaction = {
@@ -2201,25 +2894,69 @@ impl WriteTransaction {
             free_until = free_until.min(TransactionId::new(savepoint_horizon).next());
         }
 
+        #[cfg(all(test, not(redb_no_std)))]
+        self.retain_fixed_phase_for_fixture(1)?; // actual MAIN already published
         let mut freed_any = false;
         let (system_root, stored_system_freed_pages, extracted_data_transactions) = {
+            // Same owner and lock order as the precommit pass; no fresh budget.
+            let mut owner = self.reclamation.lock().unwrap();
             let mut system_tables = self.system_tables.lock().unwrap();
             let system_freed_pages = system_tables.system_freed_pages();
-            let extracted_data_transactions = Self::extract_freed_pages(
-                &mut system_tables,
-                DATA_FREED_TABLE,
-                free_until,
-                |page| {
-                    freed_any = true;
-                    // See process_freed_pages(): free_until excludes pages that are still needed
-                    // by a live reader or pending non-durable commit.
-                    debug_assert!(!self.mem.unpersisted(page));
-                    page_allocator.free(page, &PageTracker::ignore());
-                },
-            )?;
-            if !freed_any {
+            let mut free_page = |page| {
+                freed_any = true;
+                // The captured savepoint/ancestor horizon is unchanged.
+                debug_assert!(!self.mem.unpersisted(page));
+                page_allocator.free(page, &PageTracker::ignore());
+            };
+            let (extracted_data_transactions, removed_any) = if let Some(budget) = owner.as_mut() {
+                #[cfg(all(test, not(redb_no_std)))]
+                self.record_fixed_phase_for_test(2, budget, free_until, 0);
+                let extracted = bounded_reclamation::extract(
+                    &mut system_tables,
+                    free_until,
+                    {
+                        #[cfg(not(redb_no_std))]
+                        {
+                            self.checked_source_immediate
+                        }
+                        #[cfg(redb_no_std)]
+                        {
+                            false
+                        }
+                    },
+                    budget,
+                    &mut free_page,
+                )?;
+                #[cfg(all(test, not(redb_no_std)))]
+                self.record_fixed_phase_for_test(3, budget, free_until, extracted.removed);
+                (extracted.completed, extracted.removed != 0)
+            } else {
+                let extracted = Self::extract_freed_pages(
+                    &mut system_tables,
+                    DATA_FREED_TABLE,
+                    free_until,
+                    &mut free_page,
+                )?;
+                // Preserve the legacy empty-DATA epilogue behavior. The finite
+                // path explicitly accounts for empty record removal above.
+                (crate::tree_store::NativeOwnedTxnIds::from(extracted), false)
+            };
+            #[cfg(all(test, not(redb_no_std)))]
+            if removed_any
+                && matches!(
+                    self.fixed_phase_fault,
+                    Some(NativeFixedPhaseFault::AfterMainAfterPostExtraction)
+                )
+            {
+                // Main durability is real. Preserve normal latch/fail-closed
+                // handling and test repair from that main root, not rollback.
+                return Err(self.fixed_phase_error_for_fixture(2));
+            }
+            // An empty PageList still removed a durable key and needs publication.
+            if !freed_any && !removed_any {
                 return Ok(());
             }
+            drop(owner);
 
             let system_tree = system_tables.table_tree.flush_table_root_updates()?;
             let stored_system_freed_pages = self.store_system_freed_pages(
@@ -2237,12 +2974,13 @@ impl WriteTransaction {
 
         let epilogue_allocations = page_allocator.take_allocated_since_commit();
         self.mem
-            .record_post_commit_allocations(epilogue_allocations.iter().copied());
+            .record_post_commit_allocations(&epilogue_allocations);
         self.mem.non_durable_commit(
             user_root,
             system_root,
             epilogue_transaction,
             epilogue_allocations,
+            true,
         )?;
         self.transaction_tracker
             .reserve_transaction_id(epilogue_transaction, self.transaction_id);
@@ -2252,12 +2990,22 @@ impl WriteTransaction {
             self.transaction_id,
             stored_system_freed_pages,
         )?;
-        // The epilogue only extracts DATA_FREED_TABLE entries. It is still correct to clear these
-        // ids from the non-durable scan set: ordinary non-durable commits filter unpersisted
-        // system pages before writing SYSTEM_FREED_TABLE, and durable commits process any
-        // remaining persisted system entries without consulting this tracker.
+        // The ordinary epilogue retains its DATA-only behavior: ordinary
+        // non-durable commits filter unpersisted SYSTEM pages and durable
+        // commits process remaining persisted SYSTEM entries independently.
+        // The checked fixed Source epilogue extracts BOTH families under its
+        // shared budget, and completed IDs require remaining-family probes.
+        // Never substitute the ordinary DATA-only rationale for Source proof.
         self.transaction_tracker
             .mark_non_durable_freed_pages_processed(extracted_data_transactions);
+        #[cfg(all(test, not(redb_no_std)))]
+        if let Some(budget) = self.reclamation.lock().unwrap().as_ref() {
+            // Only after actual non-durable publication/reservation/registration
+            // and completed-ID processing succeeded; no extra runtime mutation.
+            self.record_fixed_phase_for_test(4, budget, free_until, 0);
+        }
+        #[cfg(all(test, not(redb_no_std)))]
+        self.retain_fixed_phase_for_fixture(2)?; // actual POST publication complete
 
         Ok(())
     }
@@ -2266,7 +3014,7 @@ impl WriteTransaction {
     pub(crate) fn non_durable_commit(
         &mut self,
         user_root: Option<BtreeHeader>,
-        allocated_pages: Vec<PageNumber>,
+        allocated_pages: NativeOwnedPageVec,
         stored_data_freed_pages: bool,
     ) -> Result {
         let free_until_transaction = self
@@ -2310,6 +3058,7 @@ impl WriteTransaction {
             system_root,
             self.transaction_id,
             newly_unpersisted,
+            false,
         )?;
         // Record the data-tree pages allocated in this transaction in the in-memory map.
         self.mem
@@ -2411,6 +3160,34 @@ impl WriteTransaction {
             page_allocator.free(page, &PageTracker::ignore());
         };
 
+        let bounded = {
+            let mut owner = self.reclamation.lock().unwrap();
+            if let Some(budget) = owner.as_mut() {
+                let mut system_tables = self.system_tables.lock().unwrap();
+                #[cfg(all(test, not(redb_no_std)))]
+                self.record_fixed_phase_for_test(0, budget, free_until, 0);
+                let extracted = bounded_reclamation::extract(
+                    &mut system_tables,
+                    free_until,
+                    true,
+                    budget,
+                    &mut free_page,
+                )?;
+                #[cfg(all(test, not(redb_no_std)))]
+                self.record_fixed_phase_for_test(1, budget, free_until, extracted.removed);
+                Some(extracted.completed)
+            } else {
+                None
+            }
+        };
+        if let Some(completed) = bounded {
+            // Preserve the existing tracker update's lock boundary: table and
+            // finite-budget guards are already physically released.
+            self.transaction_tracker
+                .mark_non_durable_freed_pages_processed(completed);
+            return Ok(());
+        }
+
         let extracted_transactions = {
             let mut system_tables = self.system_tables.lock().unwrap();
             let mut extracted_transactions = Self::extract_freed_pages(
@@ -2504,19 +3281,37 @@ impl WriteTransaction {
                 pagination_id: 0,
             };
             loop {
-                let Some(entry) = data_freed.get(&key)? else {
-                    break;
+                let last = TransactionIdWithPagination {
+                    transaction_id: transaction_id.raw_id(),
+                    pagination_id: u64::MAX,
                 };
-                let pages = entry.value();
-                let mut new_pages = vec![];
-                for i in 0..pages.len() {
-                    let page = pages.get(i);
-                    if !self.mem.free_if_unpersisted(page, &PageTracker::ignore()) {
-                        new_pages.push(page);
+                // Keep native range/page guards inside the read phase. Only the
+                // pagination scalar and the existing survivor buffer cross into
+                // the mutation phase; no owning page alias remains there.
+                let (pagination, new_pages, changed) = {
+                    let mut range = data_freed.range(key..=last)?;
+                    let Some((actual_key, entry)) = range.next().transpose()? else {
+                        break;
+                    };
+                    drop(range);
+                    let pagination = actual_key.value().pagination_id;
+                    drop(actual_key);
+                    let pages = entry.value();
+                    let mut new_pages = vec![];
+                    for i in 0..pages.len() {
+                        let page = pages.get(i);
+                        if !self.mem.free_if_unpersisted(page, &PageTracker::ignore()) {
+                            new_pages.push(page);
+                        }
                     }
-                }
-                if new_pages.len() != pages.len() {
-                    drop(entry);
+                    let changed = new_pages.len() != pages.len();
+                    (pagination, new_pages, changed)
+                };
+                key = TransactionIdWithPagination {
+                    transaction_id: transaction_id.raw_id(),
+                    pagination_id: pagination,
+                };
+                if changed {
                     if new_pages.is_empty() {
                         data_freed.remove(&key)?;
                     } else {
@@ -2527,7 +3322,10 @@ impl WriteTransaction {
                         }
                     }
                 }
-                key.pagination_id += 1;
+                let Some(next_pagination) = pagination.checked_add(1) else {
+                    break;
+                };
+                key.pagination_id = next_pagination;
             }
             processed.push(transaction_id);
         }
@@ -2572,7 +3370,7 @@ impl WriteTransaction {
         &self,
         system_tree: &mut TableTreeMut,
         transaction_id: TransactionId,
-        system_freed_pages: Arc<Mutex<Vec<PageNumber>>>,
+        system_freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
         mut unpersisted_pages: Option<&mut Vec<PageNumber>>,
     ) -> Result<bool> {
         assert_eq!(PageNumber::serialized_size(), 8); // We assume below that PageNumber is length 8
@@ -2587,7 +3385,7 @@ impl WriteTransaction {
                 let mut pagination_id =
                     Self::next_system_freed_pagination_id(system_freed_tree, transaction_id)?;
                 while !system_freed_pages.lock().unwrap().is_empty() {
-                    let chunk_size = 200;
+                    let chunk_size = SYSTEM_PAGE_LIST_CHUNK;
                     let buffer_size = PageList::required_bytes(chunk_size);
                     let key = TransactionIdWithPagination {
                         transaction_id: transaction_id.raw_id(),
@@ -2759,7 +3557,7 @@ impl ReadTransaction {
         guard: TransactionGuard,
         root_page: Option<BtreeHeader>,
     ) -> Result<Self, TransactionError> {
-        let guard = Arc::new(guard);
+        let guard = NativeOwnedShared::ordinary(guard);
         let resolver = PageResolver::new(mem.clone());
         Ok(Self {
             mem,
@@ -2768,6 +3566,121 @@ impl ReadTransaction {
         })
     }
 
+    // Numerical-only definition-path inspection. The closed compiled recipe
+    // supplies its exact bounded names; this does not open/decode each table.
+    pub(crate) fn inspect_prepared_resource_table_definitions<'tree, 'keys, 'epoch, 'tracker>(
+        &'tree self,
+        keys: &'keys [crate::tree_store::NativePreparedNormalKey<'keys>],
+        epoch: &'epoch crate::transaction_tracker::NativeResourceEpoch<'tracker>,
+    ) -> Result<
+        crate::tree_store::NativeEpochKeyBatch<
+            'tree,
+            'keys,
+            'epoch,
+            'tracker,
+            &'static str,
+            InternalTableDefinition,
+        >,
+        crate::tree_store::NativeKeyPathError,
+    > {
+        self.tree.inspect_prepared_resource_definitions(keys, epoch)
+    }
+
+    // Closed actual-read control admission. No caller byte estimate, raw tree,
+    // memory getter, registration tuple or detached allocator is accepted.
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn prepare_fixed_execution_buffers(
+        &self,
+        actual: &crate::Database,
+        numerical: &crate::tree_store::NativeNumericalEpoch,
+        demand: &crate::db::NativeFixedExecutionBufferDemand,
+    ) -> core::result::Result<
+        crate::db::NativeFixedExecutionBuffers,
+        crate::db::NativeFixedCleanupError,
+    > {
+        let guard = self
+            .tree
+            .transaction_guard()
+            .checked_pinned_read_parts()
+            .map_err(crate::tree_store::NativeKeyPathError::Epoch)?
+            .ok_or(crate::tree_store::NativeKeyPathError::Unpinned)?;
+        crate::db::NativePreparedFixedCleanup::require_actual_read(actual, &guard)?;
+        demand
+            .prepare_on_actual_resolver(&self.tree.read_page_resolver(), numerical)
+            .map_err(Into::into)
+    }
+
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn admit_fixed_cleanup_capture_control(
+        &self,
+        actual: &crate::Database,
+        numerical: &crate::tree_store::NativeNumericalEpoch,
+    ) -> core::result::Result<
+        crate::tree_store::NativeControlAllocation,
+        crate::tree_store::NativeKeyPathError,
+    > {
+        use crate::tree_store::NativeKeyPathError as E;
+        numerical.require_open()?;
+        let resolver = self.tree.read_page_resolver();
+        let parts = self
+            .tree
+            .transaction_guard()
+            .checked_pinned_read_parts()
+            .map_err(E::Epoch)?
+            .ok_or(E::Unpinned)?;
+        if !Arc::ptr_eq(&self.mem, parts.actual_memory()) {
+            return Err(E::ForeignOwner);
+        }
+        crate::db::NativePreparedFixedCleanup::require_actual_read(actual, &parts)?;
+        // Zero-byte native affinity check has no allocation/reservation growth.
+        // It also checks actual managed serial under the existing admission
+        // mutex. Foreign engine/pin/pool refuses before the full control admit.
+        let affinity = resolver.admit_fixed_observation(0)?;
+        if !affinity.belongs_to(numerical.resources()) {
+            return Err(E::ForeignOwner);
+        }
+        resolver
+            .seal_fixed_observation_admission()?
+            .require_current()?;
+        numerical.require_open()?;
+        Ok(resolver.admit_fixed_observation(
+            crate::db::NativePreparedFixedCleanup::capture_control_bytes(),
+        )?)
+    }
+
+    pub(crate) fn capture_native_system_read<'read, 'epoch, 'tracker>(
+        &'read self,
+        epoch: &'epoch crate::transaction_tracker::NativeResourceEpoch<'tracker>,
+    ) -> core::result::Result<
+        NativeSystemRead<'read, 'epoch, 'tracker>,
+        crate::tree_store::NativeKeyPathError,
+    > {
+        NativeSystemRead::capture(self, epoch)
+    }
+
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn new_with_read_context(
+        mem: Arc<TransactionalMemory>,
+        guard: TransactionGuard,
+        root: Option<BtreeHeader>,
+        context: crate::tree_store::NativeReadContext,
+    ) -> core::result::Result<Self, TransactionError> {
+        // Source complete-planner observations retain the actual same-pool
+        // guard/control allocation through their last native table/page alias.
+        // Existing numerical readonly contexts preserve the ordinary Arc path.
+        let guard = if context.resources.is_source_write() {
+            NativeOwnedShared::source(guard, &context.resources)
+                .map_err(TransactionError::Storage)?
+        } else {
+            NativeOwnedShared::ordinary(guard)
+        };
+        let resolver = PageResolver::with_read_context(mem.clone(), context);
+        Ok(Self {
+            mem,
+            tree: TableTree::new(root, PageHint::Clean, guard, resolver)
+                .map_err(TransactionError::Storage)?,
+        })
+    }
     /// Open the given table
     pub fn open_table<K: Key + 'static, V: Value + 'static>(
         &self,
@@ -2784,7 +3697,7 @@ impl ReadTransaction {
                 table_root,
                 PageHint::Clean,
                 self.tree.transaction_guard().clone(),
-                PageResolver::new(self.mem.clone()),
+                self.tree.read_page_resolver(),
             )?),
             InternalTableDefinition::Multimap { .. } => unreachable!(),
         }
@@ -2813,7 +3726,7 @@ impl ReadTransaction {
                 fixed_key_size,
                 fixed_value_size,
                 self.tree.transaction_guard().clone(),
-                PageResolver::new(self.mem.clone()),
+                self.tree.read_page_resolver(),
             )),
             InternalTableDefinition::Multimap { .. } => unreachable!(),
         }
@@ -2841,7 +3754,7 @@ impl ReadTransaction {
                 table_length,
                 PageHint::Clean,
                 self.tree.transaction_guard().clone(),
-                PageResolver::new(self.mem.clone()),
+                self.tree.read_page_resolver(),
             )?),
         }
     }
@@ -2872,7 +3785,7 @@ impl ReadTransaction {
                 fixed_key_size,
                 fixed_value_size,
                 self.tree.transaction_guard().clone(),
-                PageResolver::new(self.mem.clone()),
+                self.tree.read_page_resolver(),
             )),
         }
     }
@@ -2899,7 +3812,7 @@ impl ReadTransaction {
     ///
     /// Returns `ReadTransactionStillInUse` error if a table or other object retrieved from the transaction still references this transaction
     pub fn close(self) -> Result<(), TransactionError> {
-        if Arc::strong_count(self.tree.transaction_guard()) > 1 {
+        if self.tree.transaction_guard().strong_count() > 1 {
             return Err(TransactionError::ReadTransactionStillInUse(Box::new(self)));
         }
         // No-op, just drop ourself
@@ -2912,6 +3825,10 @@ impl Debug for ReadTransaction {
         f.write_str("ReadTransaction")
     }
 }
+
+#[cfg(test)]
+#[path = "bounded_reclamation_tests.rs"]
+mod bounded_reclamation_tests;
 
 #[cfg(test)]
 mod test {
@@ -3317,3 +4234,44 @@ mod test {
         assert!(write_txn.transaction_id > remove_txn_id.next());
     }
 }
+
+#[cfg(all(test, not(redb_no_std)))]
+#[path = "native_system_resource_path_tests.rs"]
+mod native_system_resource_path_tests;
+
+#[cfg(all(test, not(redb_no_std)))]
+#[path = "native_prepared_reclamation_test_support.rs"]
+mod native_prepared_reclamation_test_support;
+#[cfg(all(test, not(redb_no_std)))]
+#[path = "native_prepared_reclamation_tests.rs"]
+mod native_prepared_reclamation_tests;
+
+#[cfg(not(redb_no_std))]
+#[path = "native_read_context.rs"]
+mod native_read_context;
+#[cfg(not(redb_no_std))]
+pub use native_read_context::NativeReadContextPlan;
+
+#[cfg(not(redb_no_std))]
+pub(crate) use native_read_context::read_context_work_bound;
+
+#[cfg(not(redb_no_std))]
+#[path = "native_txn_metadata.rs"]
+mod native_txn_metadata;
+#[cfg(not(redb_no_std))]
+use native_txn_metadata::NativePreparedNamespace;
+#[cfg(not(redb_no_std))]
+pub(crate) use native_txn_metadata::NativePreparedTxnMetadata;
+
+#[cfg(not(redb_no_std))]
+#[path = "native_fixed_data_census.rs"]
+mod native_fixed_data_census;
+#[cfg(not(redb_no_std))]
+pub(crate) use native_fixed_data_census::{
+    NativeFixedDataCensus, NativeFixedDataError, NativeFixedDataFailure,
+};
+
+#[cfg(not(redb_no_std))]
+pub(crate) use bounded_reclamation::ReclamationBudget as NativeFixedReclamationBudget;
+#[cfg(not(redb_no_std))]
+pub(crate) use native_system_resource_paths::NativeAllocatedPrefixWork;

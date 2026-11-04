@@ -76,6 +76,12 @@ impl<K: Key + 'static, V: Value + 'static> BtreeCursorRange<K, V> {
         manager: PageResolver,
         hint: PageHint,
     ) -> Result<Self> {
+        if let Included(key) | Excluded(key) = &lower_bound {
+            super::btree::resource_key_paths::check_btree_key::<K>(key)?;
+        }
+        if let Included(key) | Excluded(key) = &upper_bound {
+            super::btree::resource_key_paths::check_btree_key::<K>(key)?;
+        }
         if table_root.is_none() || bounds_are_empty::<K>(&lower_bound, &upper_bound) {
             return Ok(Self::empty(manager, hint));
         }

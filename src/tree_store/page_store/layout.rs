@@ -71,7 +71,7 @@ impl RegionLayout {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DatabaseLayout {
     full_region_layout: RegionLayout,
     num_full_regions: u32,
@@ -79,6 +79,115 @@ pub(crate) struct DatabaseLayout {
 }
 
 impl DatabaseLayout {
+    // The sole growth geometry is shared by execution and prospective resource
+    // planning. It allocates nothing and refuses overflow before file resize.
+    pub(super) fn growth_for(
+        &self,
+        required_order: u8,
+    ) -> Result<Self, super::allocator_reopen_facts::AllocatorResourceError> {
+        use super::allocator_reopen_facts::AllocatorResourceError as E;
+        use super::base::{MAX_PAGE_INDEX, MAX_REGIONS};
+        use super::page_manager::MAX_MAX_PAGE_ORDER;
+        let full = self.full_region_layout;
+        let pages = full.num_pages;
+        let page_size = u64::from(full.page_size);
+        if pages == 0
+            || pages > MAX_PAGE_INDEX + 1
+            || page_size == 0
+            || !full.page_size.is_power_of_two()
+            || required_order > MAX_MAX_PAGE_ORDER
+        {
+            return Err(E::Unsupported);
+        }
+        let required_pages = 1_u64
+            .checked_shl(u32::from(required_order))
+            .ok_or(E::Overflow)?;
+        if required_pages > u64::from(pages) {
+            return Err(E::Unsupported);
+        }
+        let region_bytes = u64::from(pages).checked_mul(page_size).ok_or(E::Overflow)?;
+        let required = required_pages.checked_mul(page_size).ok_or(E::Overflow)?;
+        let trailing = if let Some(tail) = self.trailing_partial_region {
+            // Native calculate() legitimately represents one exactly-full
+            // region as a trailing region, so equality remains supported.
+            if tail.num_pages == 0
+                || tail.num_pages > pages
+                || tail.header_pages != full.header_pages
+                || tail.page_size != full.page_size
+            {
+                return Err(E::Incomplete);
+            }
+            u64::from(tail.num_pages)
+                .checked_mul(page_size)
+                .ok_or(E::Overflow)?
+        } else {
+            0
+        };
+        let regions = self
+            .num_full_regions
+            .checked_add(u32::from(self.trailing_partial_region.is_some()))
+            .ok_or(E::Overflow)?;
+        if regions == 0 || regions > MAX_REGIONS {
+            return Err(E::Unsupported);
+        }
+        let usable = u64::from(self.num_full_regions)
+            .checked_mul(region_bytes)
+            .and_then(|n| n.checked_add(trailing))
+            .ok_or(E::Overflow)?;
+        let twice_required = required.checked_mul(2).ok_or(E::Overflow)?;
+        let desired = if self.num_full_regions > 0 {
+            if self.trailing_partial_region.is_some() {
+                let remainder = region_bytes.checked_sub(trailing).ok_or(E::Incomplete)?;
+                let extra = if twice_required < remainder {
+                    remainder
+                } else {
+                    remainder.checked_add(region_bytes).ok_or(E::Overflow)?
+                };
+                usable.checked_add(extra).ok_or(E::Overflow)?
+            } else {
+                usable.checked_add(region_bytes).ok_or(E::Overflow)?
+            }
+        } else {
+            usable
+                .checked_mul(2)
+                .ok_or(E::Overflow)?
+                .max(usable.checked_add(twice_required).ok_or(E::Overflow)?)
+        };
+        let next_regions = desired.div_ceil(region_bytes);
+        if next_regions == 0 || next_regions > u64::from(MAX_REGIONS) {
+            return Err(E::Unsupported);
+        }
+        // Check the complete physical length before calling the original
+        // native layout constructor, whose trusted arithmetic is unchecked.
+        let next_full = if desired <= region_bytes {
+            0
+        } else {
+            desired / region_bytes
+        };
+        let next_trailing = desired
+            .checked_sub(next_full.checked_mul(region_bytes).ok_or(E::Overflow)?)
+            .ok_or(E::Overflow)?;
+        let header_bytes = u64::from(full.header_pages)
+            .checked_mul(page_size)
+            .ok_or(E::Overflow)?;
+        let full_bytes = region_bytes.checked_add(header_bytes).ok_or(E::Overflow)?;
+        page_size
+            .checked_add(next_full.checked_mul(full_bytes).ok_or(E::Overflow)?)
+            .and_then(|n| {
+                if next_trailing == 0 {
+                    Some(n)
+                } else {
+                    n.checked_add(header_bytes)?.checked_add(next_trailing)
+                }
+            })
+            .ok_or(E::Overflow)?;
+        Ok(Self::calculate(
+            desired,
+            pages,
+            full.header_pages,
+            full.page_size,
+        ))
+    }
     pub(super) fn new(
         full_regions: u32,
         full_region: RegionLayout,
@@ -248,3 +357,7 @@ impl DatabaseLayout {
         }
     }
 }
+
+#[cfg(all(test, not(redb_no_std)))]
+#[path = "growth_layout_tests.rs"]
+mod growth_tests;

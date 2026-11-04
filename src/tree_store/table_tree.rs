@@ -1,6 +1,8 @@
 use crate::db::TransactionGuard;
 use crate::error::TableError;
 use crate::sync::Mutex;
+use crate::tree_store::NativeOwnedPageVec;
+use crate::tree_store::NativeOwnedShared;
 use crate::tree_store::btree::{PagePath, UntypedBtreeMut, btree_stats};
 use crate::tree_store::btree_base::BtreeHeader;
 use crate::tree_store::multimap_btree::{
@@ -16,7 +18,6 @@ use crate::{DatabaseStats, Result};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::string::ToString;
-use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::max;
@@ -70,6 +71,15 @@ impl Iterator for TableNameIter {
     }
 }
 
+#[cfg(not(redb_no_std))]
+#[path = "resource_normal_namespace.rs"]
+mod resource_normal_namespace;
+#[cfg(not(redb_no_std))]
+pub(crate) use resource_normal_namespace::{
+    NORMAL_NAMESPACE_OBSERVATION, NativeFixedNamespaceCensus, NativeNamespacePutPhase,
+    NativeNormalNamespaceError, NativeNormalNamespaceRecipe,
+};
+
 pub(crate) struct TableTree {
     tree: Btree<&'static str, InternalTableDefinition>,
     mem: PageResolver,
@@ -79,7 +89,7 @@ impl TableTree {
     pub(crate) fn new(
         master_root: Option<BtreeHeader>,
         page_hint: PageHint,
-        guard: Arc<TransactionGuard>,
+        guard: NativeOwnedShared<TransactionGuard>,
         mem: PageResolver,
     ) -> Result<Self> {
         Ok(Self {
@@ -88,7 +98,60 @@ impl TableTree {
         })
     }
 
-    pub(crate) fn transaction_guard(&self) -> &Arc<TransactionGuard> {
+    pub(crate) fn read_page_resolver(&self) -> PageResolver {
+        self.mem.clone()
+    }
+    #[cfg(all(test, not(redb_no_std)))]
+    pub(crate) fn context_current_for_test(&self) -> usize {
+        self.mem.context_current_for_test()
+    }
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn with_read_context(
+        &self,
+        context: crate::tree_store::NativeReadContext,
+    ) -> Result<Self> {
+        Self::new(
+            self.tree.get_root(),
+            PageHint::Clean,
+            self.tree.transaction_guard().clone(),
+            PageResolver::with_read_context(
+                self.mem.actual_mem_for_read_context().clone(),
+                context,
+            ),
+        )
+    }
+    // Namespace definitions are a separate tree from the user-table rows.
+    // Keep their actual read pin/root and exact prepared names in the quote.
+    pub(crate) fn inspect_system_namespace_profile<'tree, 'epoch, 'tracker>(
+        &'tree self,
+        epoch: &'epoch crate::transaction_tracker::NativeResourceEpoch<'tracker>,
+    ) -> Result<
+        crate::tree_store::NativeSystemNamespaceProfile<'tree, 'epoch, 'tracker>,
+        crate::tree_store::NativeKeyPathError,
+    > {
+        self.tree.inspect_system_namespace_profile(epoch)
+    }
+
+    pub(crate) fn inspect_prepared_resource_definitions<'tree, 'keys, 'epoch, 'tracker>(
+        &'tree self,
+        keys: &'keys [crate::tree_store::NativePreparedNormalKey<'keys>],
+        epoch: &'epoch crate::transaction_tracker::NativeResourceEpoch<'tracker>,
+    ) -> Result<
+        crate::tree_store::NativeEpochKeyBatch<
+            'tree,
+            'keys,
+            'epoch,
+            'tracker,
+            &'static str,
+            InternalTableDefinition,
+        >,
+        crate::tree_store::NativeKeyPathError,
+    > {
+        self.tree
+            .inspect_prepared_resource_keys_at_epoch(keys, epoch)
+    }
+
+    pub(crate) fn transaction_guard(&self) -> &NativeOwnedShared<TransactionGuard> {
         self.tree.transaction_guard()
     }
 
@@ -171,7 +234,31 @@ impl TableTree {
         name: &str,
         table_type: TableType,
     ) -> Result<Option<InternalTableDefinition>, TableError> {
+        self.get_table_untyped_inner(
+            name,
+            table_type,
+            #[cfg(not(redb_no_std))]
+            None,
+        )
+    }
+    fn get_table_untyped_inner(
+        &self,
+        name: &str,
+        table_type: TableType,
+        #[cfg(not(redb_no_std))] expected: Option<(usize, usize)>,
+    ) -> Result<Option<InternalTableDefinition>, TableError> {
         if let Some(guard) = self.tree.get(&name)? {
+            self.mem
+                .observe_table_definition(guard.encoded_value_len())?;
+            #[cfg(not(redb_no_std))]
+            if let Some((key, value)) = expected {
+                self.mem.prepare_prepaid_definition(
+                    guard.encoded_value_bytes(),
+                    name,
+                    key,
+                    value,
+                )?;
+            }
             let definition = guard.value();
             definition.check_match_untyped(table_type, name)?;
             Ok(Some(definition))
@@ -195,6 +282,27 @@ impl TableTree {
                 None
             },
         )
+    }
+
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn get_table_prepaid<
+        K: Key + crate::types::NativeResourceTypeName,
+        V: Value + crate::types::NativeResourceTypeName,
+    >(
+        &self,
+        name: &str,
+        table_type: TableType,
+    ) -> Result<Option<InternalTableDefinition>, TableError> {
+        let key = K::INTERNAL_RESOURCE_NAME.len();
+        let value = V::INTERNAL_RESOURCE_NAME.len();
+        if let Some(definition) =
+            self.get_table_untyped_inner(name, table_type, Some((key, value)))?
+        {
+            definition.check_match::<K, V>(table_type, name)?;
+            Ok(Some(definition))
+        } else {
+            Ok(None)
+        }
     }
 
     pub(crate) fn visit_all_pages<F>(&self, mut visitor: F) -> Result
@@ -227,7 +335,7 @@ impl TableTree {
 
 pub(crate) struct TableTreeMut {
     tree: BtreeMut<&'static str, InternalTableDefinition>,
-    guard: Arc<TransactionGuard>,
+    guard: NativeOwnedShared<TransactionGuard>,
     page_allocator: PageAllocator,
     // Cached updates from tables that have been closed. These must be flushed to the btree.
     // The bool indicates whether the root has dirty (DEFERRED) checksums that need finalization.
@@ -235,18 +343,18 @@ pub(crate) struct TableTreeMut {
     // on close -- so entries cannot reference pages that an open handle frees.
     // Ordered so that commits flush table roots in a deterministic order, keeping the pages a
     // commit allocates -- and therefore the resulting file bytes -- reproducible.
-    pending_table_updates: BTreeMap<String, (Option<BtreeHeader>, u64, bool)>,
-    freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-    allocated_pages: Arc<PageTracker>,
+    pending_table_updates: crate::tree_store::NativeTxnNameMap<(Option<BtreeHeader>, u64, bool)>,
+    freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+    allocated_pages: NativeOwnedShared<PageTracker>,
 }
 
 impl TableTreeMut {
     pub(crate) fn new(
         master_root: Option<BtreeHeader>,
-        guard: Arc<TransactionGuard>,
+        guard: NativeOwnedShared<TransactionGuard>,
         page_allocator: PageAllocator,
-        freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-        allocated_pages: Arc<PageTracker>,
+        freed_pages: NativeOwnedShared<Mutex<NativeOwnedPageVec>>,
+        allocated_pages: NativeOwnedShared<PageTracker>,
     ) -> Self {
         Self {
             tree: BtreeMut::new(
@@ -258,7 +366,7 @@ impl TableTreeMut {
             ),
             guard,
             page_allocator,
-            pending_table_updates: BTreeMap::new(),
+            pending_table_updates: crate::tree_store::NativeTxnNameMap::default(),
             freed_pages,
             allocated_pages,
         }
@@ -266,6 +374,15 @@ impl TableTreeMut {
 
     pub(crate) fn page_allocator(&self) -> &PageAllocator {
         &self.page_allocator
+    }
+
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn install_prepared_pending_names(
+        &mut self,
+        prepared: crate::tree_store::NativeTxnNameMap<(Option<BtreeHeader>, u64, bool)>,
+    ) {
+        assert!(self.pending_table_updates.is_empty());
+        self.pending_table_updates = prepared;
     }
 
     pub(crate) fn set_root(&mut self, root: Option<BtreeHeader>) {
@@ -317,7 +434,7 @@ impl TableTreeMut {
             .as_ref()
             .is_some_and(|header| self.page_allocator.uncommitted(header.root));
         self.pending_table_updates
-            .insert(name.to_string(), (table_root, length, dirty));
+            .insert(name, (table_root, length, dirty));
     }
 
     pub(crate) fn clear_root_updates_and_close(&mut self) {
@@ -329,13 +446,14 @@ impl TableTreeMut {
 
     pub(crate) fn flush_and_close(
         &mut self,
-    ) -> Result<(Option<BtreeHeader>, PageNumberHashSet, Vec<PageNumber>)> {
+    ) -> Result<(Option<BtreeHeader>, PageNumberHashSet, NativeOwnedPageVec)> {
         match self.flush_inner() {
             Ok(header) => {
                 let allocated = self.allocated_pages.close()?;
-                let mut old = vec![];
                 let mut freed_pages = self.freed_pages.lock()?;
-                mem::swap(freed_pages.as_mut(), &mut old);
+                // Move the actual vector AND its capacity guard. The shared
+                // slot becomes an empty owner only after the table is closed.
+                let old = mem::take(&mut *freed_pages);
                 Ok((header, allocated, old))
             }
             Err(err) => {
@@ -352,9 +470,7 @@ impl TableTreeMut {
     }
 
     pub(crate) fn flush_table_root_updates(&mut self) -> Result<&mut Self> {
-        for (name, (new_root, new_length, dirty)) in
-            core::mem::take(&mut self.pending_table_updates)
-        {
+        for (name, (new_root, new_length, dirty)) in self.pending_table_updates.drain() {
             // Bypass .get_table() since the table types are dynamic
             let mut definition = self.tree.get(&name.as_str())?.unwrap().value();
             // No-op if the root has not changed and checksums are already finalized
@@ -562,6 +678,8 @@ impl TableTreeMut {
         new_name: &str,
         table_type: TableType,
     ) -> Result<(), TableError> {
+        self.pending_table_updates.require_name(name)?;
+        self.pending_table_updates.require_name(new_name)?;
         // Move the definition as stored, not the pending update: staged roots must stay out
         // of the master tree, since reopening the table can free their pages (see stats())
         let stored_definition = if let Some(guard) = self.tree.get(&name)? {
@@ -584,8 +702,7 @@ impl TableTreeMut {
             assert!(self.tree.insert(&new_name, &definition)?.is_none());
             // Re-keyed only after both catalog updates succeed
             if let Some(update) = self.pending_table_updates.remove(name) {
-                self.pending_table_updates
-                    .insert(new_name.to_string(), update);
+                self.pending_table_updates.insert(new_name, update);
             }
         } else {
             return Err(TableError::TableDoesNotExist(name.to_string()));
@@ -641,6 +758,7 @@ impl TableTreeMut {
         name: &str,
         table_type: TableType,
     ) -> Result<(Option<BtreeHeader>, u64), TableError> {
+        self.pending_table_updates.require_name(name)?;
         let table = if let Some(found) = self.get_table::<K, V>(name, table_type)? {
             found
         } else {
@@ -719,7 +837,7 @@ impl TableTreeMut {
             )? {
                 // Relocated roots have already-finalized checksums
                 self.pending_table_updates.insert(
-                    entry.key().to_string(),
+                    entry.key(),
                     (Some(new_root), definition.get_length(), false),
                 );
             }
