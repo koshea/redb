@@ -1,4 +1,4 @@
-//! Pinned Rust 1.98.1 / hashbrown 0.17.1 numerical layout bounds only.
+//! Pinned Rust 1.99.1 / hashbrown 0.17.1 numerical layout bounds only.
 //! Inline owners and initialized children's allocations are accounted separately.
 use core::alloc::Layout;
 use core::mem::{align_of, size_of};

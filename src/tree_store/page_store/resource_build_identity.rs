@@ -1,6 +1,6 @@
 //! Pinned trusted-compiler identity parser shared by build.rs and native tests.
-const RELEASE: &str = "1.98.1";
-const COMMIT: &str = "48a229ceaefd4985c50990b14116b6d856af0985";
+const RELEASE: &str = "1.99.1";
+const COMMIT: &str = "58cf8f9c35b355199727627d07ae34a4e2846d67";
 const TARGET: &str = "x86_64-unknown-linux-gnu";
 const MAX_VERBOSE_BYTES: usize = 4096;
 
@@ -24,7 +24,7 @@ pub(super) fn supported_identity(
     let mut lines = verbose.lines();
     if lines
         .next()
-        .is_none_or(|line| !line.starts_with("rustc 1.98.1 ("))
+        .is_none_or(|line| !line.starts_with("rustc 1.99.1 ("))
     {
         return false;
     }

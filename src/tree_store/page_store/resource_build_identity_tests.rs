@@ -1,7 +1,7 @@
 //! Synthetic parser refusals; no caller-provided compiler identity grants runtime support.
 // req: STO-020, PRJ-004, REC-001
 use super::supported_identity;
-const VERBOSE: &str = "rustc 1.98.1 (48a229cea 2026-09-24)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-24\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 23.1.0\n";
+const VERBOSE: &str = "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.1\nLLVM version: 23.1.1\n";
 fn supported(text: &str) -> bool {
     supported_identity(
         text,
@@ -15,19 +15,19 @@ fn supported(text: &str) -> bool {
 fn native_resource_identity_refuses_unknown_compiler_and_malformed_metadata() {
     assert!(supported(VERBOSE));
     assert!(!supported(
-        &VERBOSE.replace("release: 1.98.1", "release: 1.98.2")
+        &VERBOSE.replace("release: 1.99.1", "release: 1.99.2")
     ));
     assert!(!supported(
-        &VERBOSE.replace("release: 1.98.1", "release: 1.98.1-nightly")
+        &VERBOSE.replace("release: 1.99.1", "release: 1.99.1-nightly")
     ));
     assert!(!supported(&VERBOSE.replace(
-        "48a229ceaefd4985c50990b14116b6d856af0985",
+        "58cf8f9c35b355199727627d07ae34a4e2846d67",
         "0000000000000000000000000000000000000000"
     )));
-    assert!(!supported(&VERBOSE.replace("release: 1.98.1\n", "")));
-    assert!(!supported(&format!("{VERBOSE}release: 1.98.1\n")));
+    assert!(!supported(&VERBOSE.replace("release: 1.99.1\n", "")));
+    assert!(!supported(&format!("{VERBOSE}release: 1.99.1\n")));
     assert!(!supported(&format!(
-        "{VERBOSE}commit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\n"
+        "{VERBOSE}commit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\n"
     )));
     assert!(!supported(&"x".repeat(4097)));
 }
